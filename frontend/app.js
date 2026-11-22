@@ -28,8 +28,8 @@ window.addEventListener("load", () => {
             reconnectTimer = setInterval(connectWs, 2000);
         });
         ws.addEventListener("message", (e) => {
-            const snap = JSON.parse(e.data);
-            renderState(snap);
+            const event = JSON.parse(e.data);
+            renderState(event.payload);
         });
     };
 
@@ -65,8 +65,9 @@ window.addEventListener("load", () => {
         });
         const data = await res.json();
         dryRunDiv.innerHTML = `
-            <strong>Прогноз:</strong> ${data.forecast_type}<br>
-            <strong>Диапазон:</strong> ${data.date_range}<br>
+            <strong>Прогноз:</strong> ${data.prediction}<br>
+            <strong>Дата начала:</strong> ${data.date_from}<br>
+            <strong>Дата окончания:</strong> ${data.date_to}<br>
             <strong>Причина:</strong> ${data.reason}
         `;
         dryRunDiv.style.color = {
@@ -74,7 +75,7 @@ window.addEventListener("load", () => {
             DEDUPLICATE: "orange",
             QUEUE: "blue",
             WAIT_TIMER: "red"
-        }[data.forecast_type] || "black";
+        }[data.prediction] || "black";
     };
 
     runBtn.addEventListener("click", async () => {
@@ -90,7 +91,7 @@ window.addEventListener("load", () => {
             process_id: processSelect.value,
             target_date: dateInput.value
         });
-        await fetch(`/api/demo/trigger-cron?${params.toString()}`);
+        await fetch(`/api/demo/trigger-cron?${params.toString()}`, {method: "POST"});
     });
 
     dedupBtn.addEventListener("click", async () => {
@@ -161,7 +162,7 @@ window.addEventListener("load", () => {
                 <button data-id="${run.run_id}">Убить воркер</button>
             `;
             card.querySelector("button").addEventListener("click", () => {
-                fetch(`/api/demo/kill-worker/${run.run_id}`);
+                fetch(`/api/demo/kill-worker/${run.run_id}`, {method: "POST"});
             });
             runningDiv.appendChild(card);
         });
