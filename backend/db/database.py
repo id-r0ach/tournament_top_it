@@ -211,6 +211,8 @@ async def log_audit_event(
     event_type: str,
     message: str,
     details: Optional[dict] = None,
+    *,
+    conn: Optional[asyncpg.Connection] = None,
 ):
     """Insert a row into :table:`audit_logs`.
 
@@ -225,6 +227,15 @@ async def log_audit_event(
     details:
         Optional JSON payload.
     """
+    if conn is not None:
+        await conn.execute(
+            "INSERT INTO audit_logs (run_id, event_type, message, details) VALUES ($1, $2, $3, $4)",
+            run_id,
+            event_type,
+            message,
+            details or {},
+        )
+        return
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(

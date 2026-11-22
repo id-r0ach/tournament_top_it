@@ -287,7 +287,6 @@ class Orchestrator:
                             "process_id": request.process_id,
                             "target_date": str(request.target_date),
                         },
-                        conn=conn,
                     )
                     result_payload = {
                         "action": "ATTACHED",
@@ -369,13 +368,13 @@ class Orchestrator:
                         event_type="CREATED",
                         message=f"Создана заявка {process_name} на {request.target_date} ({request.initiator})",
                         details={"status": status, "user_name": request.user_name},
-                        conn=conn,
+
                     )
 
                     # Если конфликтов нет — атомарно захватываем все ключи и готовим старт воркера
                     if status == "RUNNING":
                         await lock_manager.acquire_locks(
-                            conn=conn,
+
                             run_id=run_id,
                             required_locks=lock_specs,
                             ttl_sec=self._lock_ttl_sec,
@@ -385,7 +384,7 @@ class Orchestrator:
                             event_type="STARTED",
                             message=f"Ресурсы зарезервированы, запуск #{str(run_id)[:8]} переведён в RUNNING",
                             details={"locks_count": len(lock_specs)},
-                            conn=conn,
+
                         )
                         run_to_start = run_id
                     elif status == "WAITING_TIMER":
@@ -394,7 +393,7 @@ class Orchestrator:
                             event_type="TIMER_WAIT",
                             message=blocked_reason
                             or "Переведён в ожидание таймера машины",
-                            conn=conn,
+
                         )
                     elif status == "QUEUED":
                         await database.log_audit_event(
@@ -402,7 +401,7 @@ class Orchestrator:
                             event_type="QUEUED",
                             message=blocked_reason
                             or "Поставлен в очередь ожидания ресурсов",
-                            conn=conn,
+
                         )
 
                     result_payload = {
@@ -458,7 +457,7 @@ class Orchestrator:
                     run_id=run_id,
                     event_type="CANCELLED",
                     message=f"Задача #{str(run_id)[:8]} ({row['process_name']}) отменена из {current_status}",
-                    conn=conn,
+
                 )
 
         await self._broadcast_state_safe()
@@ -507,7 +506,7 @@ class Orchestrator:
                         + (f": {error}" if error else "")
                     ),
                     details={"progress": progress_val},
-                    conn=conn,
+
                 )
 
         # Пробуждаем ожидающие задачи и рассылаем обновление интерфейса
@@ -554,7 +553,7 @@ class Orchestrator:
                             run_id=rec["run_id"],
                             event_type="QUEUED",
                             message="Пользовательских задач нет: регламентный запуск переведён из WAITING_TIMER в QUEUED",
-                            conn=conn,
+
                         )
 
                 # Загружаем все задачи, ожидающие в очереди QUEUED
@@ -613,7 +612,7 @@ class Orchestrator:
                     run_id: UUID = row["run_id"]
                     lock_token = uuid.uuid4()
                     await lock_manager.acquire_locks(
-                        conn=conn,
+
                         run_id=run_id,
                         required_locks=lock_specs,
                         ttl_sec=self._lock_ttl_sec,
@@ -634,7 +633,7 @@ class Orchestrator:
                         run_id=run_id,
                         event_type="STARTED",
                         message=f"Задача #{str(run_id)[:8]} ({row['process_name']}) запущена из очереди",
-                        conn=conn,
+
                     )
                     runs_to_launch.append(run_id)
 
@@ -711,7 +710,7 @@ class Orchestrator:
                                     f"Watchdog принудительно снял блокировки зависшего запуска "
                                     f"#{str(stale_run_id)[:8]} по истечении TTL ({self._lock_ttl_sec}с)"
                                 ),
-                                conn=conn,
+
                             )
 
                 if expired_found:

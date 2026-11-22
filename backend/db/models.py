@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -34,6 +34,10 @@ class DryRunResponse(BaseModel):
     status: str
     estimated_duration_sec: int
     required_locks: List["LockInfo"]
+    prediction: str
+    date_from: datetime
+    date_to: datetime
+    reason: str
 
 
 # ---------------------------------------------------------------------------
@@ -63,8 +67,13 @@ class RunInfo(BaseModel):
 #  Snapshot of the system state – used by the live‑dashboard endpoint.
 # ---------------------------------------------------------------------------
 class SystemStateSnapshot(BaseModel):
-    runs: List[RunInfo]
-    locks: List[LockInfo]
+    active_runs: List[RunInfo]
+    queue: List[RunInfo]
+    timer_waiting: List[RunInfo]
+    active_locks: List[LockInfo]
+    history: List[RunInfo]
+    audit_logs: List[dict[str, Any]]
+    config: dict[str, int]
 
 
 # ---------------------------------------------------------------------------

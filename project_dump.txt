@@ -1,0 +1,2643 @@
+=== FILE: backend\api\routes.py ===
+"""REST и WebSocket маршруты для API.
+
+Файлы включают только минимально необходимые эндпоинты, которые
+используют уже существующий класс :class:`~backend.core.orchestrator.Orchestrator`.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime
+from typing import Dict, List
+
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+from pathlib import Path
+
+from backend.api.ws import ConnectionManager
+from backend.core.orchestrator import Orchestrator
+from backend.core.worker import execute_risk_job, kill_worker
+from backend.db import database
+from backend.db.models import (
+    ConfigUpdateRequest,
+    RunCreateRequest,
+    SystemStateSnapshot,
+)
+
+# ---------------------------------------------------------------------------
+# 1. Создаём менеджер WebSocket и экземпляр оркестра.
+# ---------------------------------------------------------------------------
+
+ws_manager = ConnectionManager()
+# Create orchestrator без callback сначала
+orchestrator = Orchestrator(ws_manager=ws_manager)
+# Далее задаём callback, который будет передавать необходимые аргументы
+orchestrator._worker_callback = lambda run_id: execute_risk_job(run_id, orchestrator, ws_manager)
+
+# ---------------------------------------------------------------------------
+# 2. Определяем роутеры.
+# ---------------------------------------------------------------------------
+
+router = APIRouter(prefix="/api", tags=["orchestrator"])
+ws_router = APIRouter(tags=["websocket"])
+
+# ---------------------------------------------------------------------------
+# 3. REST эндпоинты.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/processes")
+async def list_processes() -> List[Dict[str, str]]:
+    """Возвращает список доступных процессов (id из config/processes.json)."""
+    try:
+        cfg_path = Path(__file__).resolve().parents[2] / "config" / "processes.json"
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Не удалось прочитать конфиг: {exc}")
+    return [{"id": pid} for pid in cfg.get("processes", {}).keys()]
+
+
+@router.post("/runs/dry-run")
+async def dry_run(payload: RunCreateRequest):
+    try:
+        result = await orchestrator.dry_run(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(content=result.model_dump())
+
+
+@router.post("/runs")
+async def submit_run(payload: RunCreateRequest):
+    try:
+        result = await orchestrator.submit_run(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(content=result)
+
+
+@router.delete("/runs/{run_id}")
+async def cancel_run(run_id: str):
+    uid = uuid.UUID(run_id)
+    try:
+        result = await orchestrator.cancel_run(uid)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return JSONResponse(content=result)
+
+
+@router.get("/state")
+async def get_state():
+    snapshot: SystemStateSnapshot = await orchestrator.get_state_snapshot()
+    return JSONResponse(content=snapshot.model_dump())
+
+
+@router.put("/config")
+async def update_config(payload: ConfigUpdateRequest):
+    result = await orchestrator.update_config(payload)
+    return JSONResponse(content=result)
+
+
+@router.post("/demo/trigger-cron")
+async def trigger_cron(process_id: str, target_date: str):
+    try:
+        target = datetime.fromisoformat(target_date)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Неверный формат даты: {exc}")
+    req = RunCreateRequest(
+        process_id=process_id,
+        target_date=target,
+        initiator="MACHINE",
+        user_name="Планировщик (Cron)",
+    )
+    try:
+        result = await orchestrator.submit_run(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(content=result)
+
+
+@router.post("/demo/kill-worker/{run_id}")
+async def kill_worker_endpoint(run_id: str):
+    uid = uuid.UUID(run_id)
+    kill_worker(uid)
+    await database.log_audit_event(
+        run_id=str(uid),
+        event_type="WORKER_CRASH_SIMULATED",
+        message="Simulated worker crash for testing.",
+    )
+    await orchestrator._broadcast_state_safe()
+    return JSONResponse(content={"status": "crash simulated"})
+
+# ---------------------------------------------------------------------------
+# 4. WebSocket эндпоинт.
+# ---------------------------------------------------------------------------
+
+
+@ws_router.websocket("/ws/events")
+async def websocket_endpoint(websocket: WebSocket):
+    await ws_manager.connect(websocket)
+    try:
+        state = await orchestrator.get_state_snapshot()
+        await ws_manager.send_state_to_client(websocket, state.model_dump())
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+    except Exception:
+        ws_manager.disconnect(websocket)
+
+=== FILE: backend\api\ws.py ===
+"""WebSocket manager for real‑time updates.
+
+Класс :class:`ConnectionManager` хранит активные подключения и умеет
+асинхронно рассыла��ть им сообщения о состоянии системы.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Set
+
+from fastapi import WebSocket, WebSocketDisconnect
+
+
+class ConnectionManager:
+    """Управляет подключениями WebSocket."""
+
+    def __init__(self) -> None:
+        self.active_connections: Set[WebSocket] = set()
+
+    async def connect(self, websocket: WebSocket) -> None:
+        """Добавляет клиент в активные подключения."""
+        await websocket.accept()
+        self.active_connections.add(websocket)
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        """Удаляет клиент из активных подключений."""
+        self.active_connections.discard(websocket)
+
+    async def send_state_to_client(self, websocket: WebSocket, state_payload: dict) -> None:
+        """Отправляет клиенту событие обновления состояния."""
+        event = {
+            "event": "STATE_UPDATE",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "payload": state_payload,
+        }
+        await websocket.send_json(event)
+
+    async def broadcast_state(self, state_payload: dict) -> None:
+        """Рассылает обновление всем клиентам, отключая падшие сокеты."""
+        disconnected = []
+        for ws in list(self.active_connections):
+            try:
+                await ws.send_json(
+                    {
+                        "event": "STATE_UPDATE",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "payload": state_payload,
+                    }
+                )
+            except Exception:
+                disconnected.append(ws)
+        for ws in disconnected:
+            self.disconnect(ws)
+=== FILE: backend\core\lock_manager.py ===
+"""Composite lock manager.
+
+The lock manager implements the conflict rules from section 6.1 of the
+architecture document.  It operates on the ``active_locks`` table defined in
+``backend/db/database.py``.
+
+All public methods are coroutine functions that expect an
+``asyncpg.Connection`` or ``asyncpg.Pool`` from the database layer.  The
+implementation intentionally avoids any application‑specific logic – it
+provides only the primitives required by the orchestrator and unit tests.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Iterable, List
+
+import asyncpg
+
+from .registry import ResourceLockSpec
+
+__all__ = [
+    "check_conflicts",
+    "acquire_locks",
+    "release_locks",
+    "extend_ttl",
+]
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+def _intersects(a_from: datetime, a_to: datetime, b_from: datetime, b_to: datetime) -> bool:
+    """Return ``True`` if two inclusive date ranges overlap."""
+
+    return a_from <= b_to and b_from <= a_to
+
+
+# ---------------------------------------------------------------------------
+# Lock operations
+# ---------------------------------------------------------------------------
+async def check_conflicts(
+    conn: asyncpg.Connection, required_locks: Iterable[ResourceLockSpec]
+) -> bool:
+    """Return ``True`` if *any* of ``required_locks`` conflicts.
+
+    The function follows the three‑condition rule described in section
+    6.1: matching resource, overlapping date ranges and at least one
+    non‑READ mode.
+
+    Parameters
+    ----------
+    conn:
+        A live :class:`asyncpg.Connection`.
+    required_locks:
+        Iterable of lock specifications requested by a new run.
+    """
+
+    # Pull all *active* locks that involve a resource of interest.  We
+    # filter by ``expires_at`` to avoid stale rows.
+    resource_ids = {lock.resource_id for lock in required_locks}
+    if not resource_ids:
+        return False
+
+    sql = """
+    SELECT resource_id, date_from, date_to, access_mode
+    FROM active_locks
+    WHERE resource_id = ANY($1) AND expires_at > NOW()
+    """
+    active = await conn.fetch(sql, list(resource_ids))
+    if not active:
+        return False
+
+    # Convert active rows to simple tuples for quick comparison.
+    active_locks = [
+        (
+            row["resource_id"],
+            row["date_from"].date(),
+            row["date_to"].date(),
+            row["access_mode"],
+        )
+        for row in active
+    ]
+
+    for req in required_locks:
+        for act in active_locks:
+            if req.resource_id != act[0]:
+                continue
+            # Check date overlap – inclusive boundaries.
+            if not _intersects(req.date_from, req.date_to, act[1], act[2]):
+                continue
+            # Mode compatibility – only READ + READ is allowed.
+            if req.access_mode == "READ" and act[3] == "READ":
+                continue
+            # Conflict found.
+            return True
+    return False
+
+
+async def acquire_locks(
+    conn: asyncpg.Connection,
+    run_id: str,
+    required_locks: Iterable[ResourceLockSpec],
+    ttl_sec: int,
+    *,
+    sync_response_to_workbench: bool = False,
+) -> None:
+    """Atomically acquire all ``required_locks`` for ``run_id``.
+
+    The caller must call :func:`check_conflicts` first.  The operation is
+    wrapped in a transaction to guarantee the *all‑or‑nothing* property.
+    ``ttl_sec`` determines the initial ``expires_at`` value.
+    """
+
+    # Using a transaction ensures that either all rows are inserted or
+    # none are – which matches the lock‑acquisition semantics.
+    async with conn.transaction():
+        expires_at = datetime.utcnow() + timedelta(seconds=ttl_sec)
+        values: List[tuple] = []
+        for lock in required_locks:
+            values.append(
+                (
+                    run_id,
+                    lock.resource_id,
+                    lock.date_from,
+                    lock.date_to,
+                    lock.access_mode,
+                    expires_at,
+                )
+            )
+        if values:
+            await conn.executemany(
+                """
+                INSERT INTO active_locks (run_id, resource_id, date_from, date_to, access_mode, expires_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                values,
+            )
+        # If ``values`` is empty (e.g. a process with no resources) the
+        # transaction does nothing – that's acceptable.
+
+
+async def release_locks(conn: asyncpg.Connection, run_id: str) -> None:
+    """Remove all locks held by ``run_id``.
+
+    The operation is idempotent – if no rows match the ``run_id`` the
+    statement simply affects zero rows.
+    """
+
+    await conn.execute("DELETE FROM active_locks WHERE run_id = $1", run_id)
+
+
+async def extend_ttl(conn: asyncpg.Connection, run_id: str, ttl_sec: int) -> None:
+    """Extend the ``expires_at`` timestamp of all locks for ``run_id``.
+
+    The new expiry is calculated relative to the current UTC time.
+    """
+
+    new_expiry = datetime.utcnow() + timedelta(seconds=ttl_sec)
+    await conn.execute(
+        "UPDATE active_locks SET expires_at = $1 WHERE run_id = $2",
+        new_expiry,
+        run_id,
+    )
+
+=== FILE: backend\core\orchestrator.py ===
+"""
+Модуль диспетчеризации и оркестрации параллельных расчётов рисков (backend/core/orchestrator.py).
+
+Реализует центральный класс `Orchestrator`, который координирует жизненный цикл
+всех пользовательских и регламентных запусков под единым `asyncio.Lock` (NFR-01, NFR-03):
+1. Предварительная проверка конфликтов без побочных эффектов (`dry_run`, FR-15).
+2. Дедупликация идентичных заявок по паре `(process_id, target_date)` с подпиской
+   инициатора в массив `subscribers` без создания дублирующего воркера (FR-05).
+3. Шлюз приоритетов «Люди vs Машина»: регламентные задачи (`MACHINE`) уступают
+   пользовательским (`USER`) и ожидают в статусе `WAITING_TIMER` (FR-01..FR-03).
+4. Проверка совместимости композитных ключей (`resource_id`, `date_from..date_to`, `access_mode`)
+   через `lock_manager` и постановка конфликтующих задач в FIFO-очередь `QUEUED`
+   без удержания открытых транзакций БД (FR-06..FR-09).
+5. Фоновый таймер регламентных задач (`_machine_timer_loop`) и Watchdog контроля
+   просроченных TTL-блокировок (`_watchdog_loop`, NFR-02).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import uuid
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Optional
+from uuid import UUID
+
+import asyncpg
+
+from backend.core import lock_manager
+from backend.core.registry import ProcessRegistry, ResourceLockSpec
+from backend.db import database
+from backend.db.models import (
+    ConfigUpdateRequest,
+    DryRunResponse,
+    LockInfo,
+    RunCreateRequest,
+    RunInfo,
+    SystemStateSnapshot,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class Orchestrator:
+    """Главный диспетчер процессов оценки рисков."""
+
+    def __init__(
+        self,
+        worker_callback: Optional[Callable[[UUID], Awaitable[None]]] = None,
+        ws_manager: Any = None,
+        config_path: str = "config/processes.json",
+    ) -> None:
+        """
+        Инициализирует диспетчер, реестр процессов и параметры из конфигурации.
+
+        :param worker_callback: Асинхронная корутина воркера, запускаемая при переходе задачи в RUNNING.
+        :param ws_manager: Менеджер WebSocket-подключений для мгновенной рассылки обновлений UI.
+        :param config_path: Путь к JSON-файлу конфигурации бизнес-процессов.
+        """
+        self._worker_callback = worker_callback
+        self._ws_manager = ws_manager
+        self._config_path = Path(config_path)
+
+        # Единая асинхронная блокировка гарантирует отсутствие гонок при принятии решений (NFR-01, NFR-03)
+        self._lock = asyncio.Lock()
+
+        # Реестр процессов для расчёта скользящих окон и карт доступа к ресурсам
+        self._registry = ProcessRegistry(str(self._config_path))
+
+        # Загружаем глобальные тайминги из конфигурационного файла
+        self._config: dict[str, Any] = self._load_config()
+        self._machine_timer_interval_sec: int = int(
+            self._config.get("machine_timer_interval_sec", 15)
+        )
+        self._lock_ttl_sec: int = int(self._config.get("lock_ttl_sec", 25))
+        self._heartbeat_interval_sec: int = int(
+            self._config.get("heartbeat_interval_sec", 3)
+        )
+
+        # Список фоновых корутин (таймер машины и Watchdog)
+        self._bg_tasks: list[asyncio.Task[Any]] = []
+
+    def _load_config(self) -> dict[str, Any]:
+        """Считывает базовые настройки оркестратора из config/processes.json."""
+        if not self._config_path.exists():
+            return {
+                "machine_timer_interval_sec": 15,
+                "lock_ttl_sec": 25,
+                "heartbeat_interval_sec": 3,
+                "processes": {},
+            }
+        with self._config_path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+
+    def _get_process_meta(self, process_id: str) -> dict[str, Any]:
+        """Возвращает метаданные процесса из конфига либо выбрасывает ValueError."""
+        processes = self._config.get("processes", {})
+        if process_id not in processes:
+            raise ValueError(f"Неизвестный идентификатор процесса: {process_id}")
+        return processes[process_id]
+
+    @staticmethod
+    def _row_to_run_info(row: asyncpg.Record | dict[str, Any]) -> RunInfo:
+        """Преобразует строку из таблицы `runs` в Pydantic-модель `RunInfo`."""
+        data = dict(row)
+        raw_subs = data.get("subscribers")
+        if isinstance(raw_subs, str):
+            data["subscribers"] = json.loads(raw_subs)
+        elif raw_subs is None:
+            data["subscribers"] = []
+        return RunInfo(**data)
+
+    async def _broadcast_state_safe(self) -> None:
+        """Безопасно отправляет актуальный снимок состояния всем подключённым WebSocket-клиентам."""
+        if self._ws_manager is None:
+            return
+        try:
+            snapshot = await self.get_state_snapshot()
+            await self._ws_manager.broadcast_state(snapshot.model_dump(mode="json"))
+        except Exception as exc:
+            logger.warning("Ошибка при рассылке состояния по WebSocket: %s", exc)
+
+    # -------------------------------------------------------------------------
+    # 1. Предпроверка конфликтов без создания задачи (Dry-Run, FR-15)
+    # -------------------------------------------------------------------------
+
+    async def dry_run(self, request: RunCreateRequest) -> DryRunResponse:
+        """
+        Выполняет симуляцию диспетчеризации без записи в БД и захвата блокировок.
+
+        Позволяет аналитику заранее увидеть, запустится ли процесс сразу,
+        подключится к дублю, встанет в очередь из-за конфликта или уступит пользователям.
+        """
+        self._get_process_meta(request.process_id)
+        lock_specs: list[ResourceLockSpec] = self._registry.get_required_locks(
+            request.process_id, request.target_date
+        )
+        date_from = lock_specs[0].date_from if lock_specs else request.target_date
+        date_to = lock_specs[0].date_to if lock_specs else request.target_date
+
+        async with self._lock:
+            pool = await database.get_pool()
+            async with pool.acquire() as conn:
+                # Шаг 1: Проверка на дубликат среди активных и ждущих задач (FR-05)
+                dup_row = await conn.fetchrow(
+                    """
+                    SELECT run_id, status, user_name
+                    FROM runs
+                    WHERE process_id = $1
+                      AND target_date = $2
+                      AND status IN ('WAITING_TIMER', 'QUEUED', 'RUNNING')
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    """,
+                    request.process_id,
+                    request.target_date,
+                )
+                if dup_row:
+                    short_id = str(dup_row["run_id"])[:8]
+                    return DryRunResponse(
+                        prediction="DEDUPLICATE",
+                        date_from=date_from,
+                        date_to=date_to,
+                        reason=(
+                            f"Расчёт уже активен или ожидает (#{short_id}, статус {dup_row['status']}). "
+                            f"Запрос будет присоединён к существующему запуску без дублирования нагрузки."
+                        ),
+                    )
+
+                # Шаг 2: Шлюз приоритета «Люди vs Машина» (FR-03)
+                if request.initiator == "MACHINE":
+                    user_count = await conn.fetchval(
+                        """
+                        SELECT COUNT(*)
+                        FROM runs
+                        WHERE initiator = 'USER'
+                          AND status IN ('RUNNING', 'QUEUED')
+                        """
+                    )
+                    if user_count and user_count > 0:
+                        return DryRunResponse(
+                            prediction="WAIT_TIMER",
+                            date_from=date_from,
+                            date_to=date_to,
+                            reason=(
+                                f"В системе активны или ожидают {user_count} пользовательских расчётов. "
+                                f"Регламентный запуск будет отложен по таймеру."
+                            ),
+                        )
+
+                # Шаг 3: Проверка пересечений по композитному ключу (Resource + Date_Range + Mode)
+                conflicts = await lock_manager.check_conflicts(conn, lock_specs)
+                if conflicts:
+                    first = conflicts[0]
+                    owner_short = str(first["run_id"])[:8]
+                    return DryRunResponse(
+                        prediction="QUEUE",
+                        date_from=date_from,
+                        date_to=date_to,
+                        reason=(
+                            f"Конфликт {first['req_mode']}/{first['act_mode']} по ресурсу "
+                            f"{first['resource_id']} ({first['date_from']}..{first['date_to']}) "
+                            f"с запуском #{owner_short}"
+                        ),
+                    )
+
+                # Шаг 4: Конфликтов не обнаружено — расчёт стартует мгновенно
+                return DryRunResponse(
+                    prediction="RUN_IMMEDIATELY",
+                    date_from=date_from,
+                    date_to=date_to,
+                    reason="Все целевые ресурсы и диапазоны дат свободны. Запуск начнётся немедленно.",
+                )
+
+    # -------------------------------------------------------------------------
+    # 2. Приём и маршрутизация заявки (submit_run, FR-01..FR-09)
+    # -------------------------------------------------------------------------
+
+    async def submit_run(self, request: RunCreateRequest) -> dict[str, Any]:
+        """
+        Регистрирует новую заявку на расчёт или присоединяет пользователя к существующему дублю.
+
+        Все проверки и захват блокировок выполняются атомарно под `self._lock`.
+        """
+        proc_meta = self._get_process_meta(request.process_id)
+        process_name: str = proc_meta.get("name", request.process_id)
+        lock_specs: list[ResourceLockSpec] = self._registry.get_required_locks(
+            request.process_id, request.target_date
+        )
+        date_from = lock_specs[0].date_from if lock_specs else request.target_date
+        date_to = lock_specs[0].date_to if lock_specs else request.target_date
+
+        run_to_start: Optional[UUID] = None
+        result_payload: dict[str, Any]
+
+        async with self._lock:
+            pool = await database.get_pool()
+            async with pool.acquire() as conn:
+                # 1. Дедупликация: ищем идентичный процесс на ту же дату в активных/ждущих статусах
+                dup_row = await conn.fetchrow(
+                    """
+                    SELECT *
+                    FROM runs
+                    WHERE process_id = $1
+                      AND target_date = $2
+                      AND status IN ('WAITING_TIMER', 'QUEUED', 'RUNNING')
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    """,
+                    request.process_id,
+                    request.target_date,
+                )
+
+                if dup_row:
+                    existing_id: UUID = dup_row["run_id"]
+                    subscribers: list[str] = (
+                        json.loads(dup_row["subscribers"])
+                        if isinstance(dup_row["subscribers"], str)
+                        else list(dup_row["subscribers"] or [])
+                    )
+                    # Добавляем инициатора в список подписчиков, если его там ещё нет
+                    if request.user_name not in subscribers:
+                        subscribers.append(request.user_name)
+
+                    updated_row = await conn.fetchrow(
+                        """
+                        UPDATE runs
+                        SET subscribers = $1::jsonb
+                        WHERE run_id = $2
+                        RETURNING *
+                        """,
+                        json.dumps(subscribers, ensure_ascii=False),
+                        existing_id,
+                    )
+                    await database.log_audit_event(
+                        run_id=existing_id,
+                        event_type="DEDUPLICATED",
+                        message=(
+                            f"Заявка от {request.user_name} ({request.initiator}) присоединена к "
+                            f"активному запуску #{str(existing_id)[:8]}"
+                        ),
+                        details={
+                            "subscriber": request.user_name,
+                            "initiator": request.initiator,
+                            "process_id": request.process_id,
+                            "target_date": str(request.target_date),
+                        },
+                    )
+                    result_payload = {
+                        "action": "ATTACHED",
+                        "run": self._row_to_run_info(updated_row),
+                    }
+                else:
+                    # 2. Создаём новый экземпляр запуска
+                    run_id = uuid.uuid4()
+                    status = "RUNNING"
+                    blocked_reason: Optional[str] = None
+                    lock_token: Optional[UUID] = None
+                    started_at: Optional[datetime] = None
+
+                    # Проверяем приоритет пользователей перед регламентной машиной (FR-03)
+                    if request.initiator == "MACHINE":
+                        user_active_count = await conn.fetchval(
+                            """
+                            SELECT COUNT(*)
+                            FROM runs
+                            WHERE initiator = 'USER'
+                              AND status IN ('RUNNING', 'QUEUED')
+                            """
+                        )
+                        if user_active_count and user_active_count > 0:
+                            status = "WAITING_TIMER"
+                            blocked_reason = f"Ожидание завершения пользовательских задач ({user_active_count} в работе)"
+
+                    # Если задача не отложена по таймеру машины — проверяем конфликты ресурсов
+                    if status != "WAITING_TIMER":
+                        conflicts = await lock_manager.check_conflicts(conn, lock_specs)
+                        if conflicts:
+                            # По FR-08 ставим в очередь в памяти/БД без открытия рабочих транзакций
+                            status = "QUEUED"
+                            first = conflicts[0]
+                            owner_short = str(first["run_id"])[:8]
+                            blocked_reason = (
+                                f"Конфликт {first['req_mode']}/{first['act_mode']} по {first['resource_id']} "
+                                f"({first['date_from']}..{first['date_to']}) с #{owner_short}"
+                            )
+                        else:
+                            status = "RUNNING"
+                            lock_token = uuid.uuid4()
+                            started_at = datetime.now(timezone.utc)
+
+                    # Вставляем запись о запуске в таблицу `runs`
+                    inserted_row = await conn.fetchrow(
+                        """
+                        INSERT INTO runs (
+                            run_id, process_id, process_name, target_date,
+                            date_from, date_to, initiator, user_name,
+                            status, stage, progress, subscribers,
+                            blocked_reason, lock_token, started_at
+                        )
+                        VALUES (
+                            $1, $2, $3, $4,
+                            $5, $6, $7, $8,
+                            $9, NULL, 0, $10::jsonb,
+                            $11, $12, $13
+                        )
+                        RETURNING *
+                        """,
+                        run_id,
+                        request.process_id,
+                        process_name,
+                        request.target_date,
+                        date_from,
+                        date_to,
+                        request.initiator,
+                        request.user_name,
+                        status,
+                        json.dumps([request.user_name], ensure_ascii=False),
+                        blocked_reason,
+                        lock_token,
+                        started_at,
+                    )
+
+                    await database.log_audit_event(
+                        run_id=run_id,
+                        event_type="CREATED",
+                        message=f"Создана заявка {process_name} на {request.target_date} ({request.initiator})",
+                        details={"status": status, "user_name": request.user_name},
+
+                    )
+
+                    # Если конфликтов нет — атомарно захватываем все ключи и готовим старт воркера
+                    if status == "RUNNING":
+                        await lock_manager.acquire_locks(
+
+                            run_id=run_id,
+                            required_locks=lock_specs,
+                            ttl_sec=self._lock_ttl_sec,
+                        )
+                        await database.log_audit_event(
+                            run_id=run_id,
+                            event_type="STARTED",
+                            message=f"Ресурсы зарезервированы, запуск #{str(run_id)[:8]} переведён в RUNNING",
+                            details={"locks_count": len(lock_specs)},
+
+                        )
+                        run_to_start = run_id
+                    elif status == "WAITING_TIMER":
+                        await database.log_audit_event(
+                            run_id=run_id,
+                            event_type="TIMER_WAIT",
+                            message=blocked_reason
+                            or "Переведён в ожидание таймера машины",
+
+                        )
+                    elif status == "QUEUED":
+                        await database.log_audit_event(
+                            run_id=run_id,
+                            event_type="QUEUED",
+                            message=blocked_reason
+                            or "Поставлен в очередь ожидания ресурсов",
+
+                        )
+
+                    result_payload = {
+                        "action": "CREATED",
+                        "run": self._row_to_run_info(inserted_row),
+                    }
+
+        # Запускаем воркер уже после освобождения self._lock
+        if run_to_start is not None and self._worker_callback is not None:
+            asyncio.create_task(self._worker_callback(run_to_start))
+
+        await self._broadcast_state_safe()
+        return result_payload
+
+    # -------------------------------------------------------------------------
+    # 3. Отмена задачи из очереди или таймера (cancel_run, FR-16)
+    # -------------------------------------------------------------------------
+
+    async def cancel_run(self, run_id: UUID) -> dict[str, Any]:
+        """
+        Отменяет задачу, находящуюся в статусе `QUEUED` или `WAITING_TIMER`.
+
+        Если задача уже выполняется (`RUNNING`) или завершена, выбрасывает `ValueError`
+        (API вернёт HTTP 409 Conflict).
+        """
+        async with self._lock:
+            pool = await database.get_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT status, process_name FROM runs WHERE run_id = $1",
+                    run_id,
+                )
+                if not row:
+                    raise KeyError(f"Запуск {run_id} не найден")
+
+                current_status = row["status"]
+                if current_status not in ("QUEUED", "WAITING_TIMER"):
+                    raise ValueError(
+                        f"Нельзя отменить задачу в статусе {current_status} (допустимо только QUEUED или WAITING_TIMER)"
+                    )
+
+                await conn.execute(
+                    """
+                    UPDATE runs
+                    SET status = 'CANCELLED',
+                        blocked_reason = 'Отменено пользователем',
+                        finished_at = NOW()
+                    WHERE run_id = $1
+                    """,
+                    run_id,
+                )
+                await database.log_audit_event(
+                    run_id=run_id,
+                    event_type="CANCELLED",
+                    message=f"Задача #{str(run_id)[:8]} ({row['process_name']}) отменена из {current_status}",
+
+                )
+
+        await self._broadcast_state_safe()
+        return {"status": "CANCELLED", "run_id": str(run_id)}
+
+    # -------------------------------------------------------------------------
+    # 4. Завершение задачи и пробуждение очереди (complete_run / process_queue, FR-10)
+    # -------------------------------------------------------------------------
+
+    async def complete_run(
+        self,
+        run_id: UUID,
+        status: str = "COMPLETED",
+        error: Optional[str] = None,
+    ) -> None:
+        """
+        Фиксирует завершение воркера (`COMPLETED` или `FAILED`), гарантированно
+        освобождает его блокировки и немедленно запускает пересмотр очереди.
+        """
+        async with self._lock:
+            pool = await database.get_pool()
+            async with pool.acquire() as conn:
+                progress_val = 100 if status == "COMPLETED" else 0
+                await conn.execute(
+                    """
+                    UPDATE runs
+                    SET status = $1,
+                        progress = CASE WHEN $1 = 'COMPLETED' THEN 100 ELSE progress END,
+                        blocked_reason = $2,
+                        finished_at = NOW()
+                    WHERE run_id = $3
+                      AND status = 'RUNNING'
+                    """,
+                    status,
+                    error,
+                    run_id,
+                )
+                # Гарантированно удаляем все ключи блокировок данного запуска
+                await lock_manager.release_locks(conn, run_id)
+
+                await database.log_audit_event(
+                    run_id=run_id,
+                    event_type=status,
+                    message=(
+                        f"Запуск #{str(run_id)[:8]} завершён со статусом {status}"
+                        + (f": {error}" if error else "")
+                    ),
+                    details={"progress": progress_val},
+
+                )
+
+        # Пробуждаем ожидающие задачи и рассылаем обновление интерфейса
+        await self.process_queue()
+        await self._broadcast_state_safe()
+
+    async def process_queue(self) -> None:
+        """
+        Пересматривает очередь ожидания и таймер машины (FR-10).
+
+        1. Если в системе не осталось активных/ждущих пользовательских задач (`USER`),
+           переводит регламентные задачи из `WAITING_TIMER` в `QUEUED`.
+        2. Сортирует задачи в `QUEUED` по приоритету (`USER` выше `MACHINE`) и времени
+           создания (`created_at ASC` — FIFO) и запускает все задачи, чьи ресурсы свободны.
+        """
+        runs_to_launch: list[UUID] = []
+
+        async with self._lock:
+            pool = await database.get_pool()
+            async with pool.acquire() as conn:
+                # Проверяем наличие пользовательских задач в работе или очереди
+                user_active_count = await conn.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM runs
+                    WHERE initiator = 'USER'
+                      AND status IN ('RUNNING', 'QUEUED')
+                    """
+                )
+
+                # Если пользовательских задач 0 — освобождаем регламентные задачи из таймера
+                if not user_active_count or user_active_count == 0:
+                    promoted = await conn.fetch(
+                        """
+                        UPDATE runs
+                        SET status = 'QUEUED',
+                            blocked_reason = 'Переведено из таймера в общую очередь'
+                        WHERE status = 'WAITING_TIMER'
+                        RETURNING run_id
+                        """
+                    )
+                    for rec in promoted:
+                        await database.log_audit_event(
+                            run_id=rec["run_id"],
+                            event_type="QUEUED",
+                            message="Пользовательских задач нет: регламентный запуск переведён из WAITING_TIMER в QUEUED",
+
+                        )
+
+                # Загружаем все задачи, ожидающие в очереди QUEUED
+                queued_rows = await conn.fetch(
+                    """
+                    SELECT run_id, process_id, process_name, target_date, initiator, created_at
+                    FROM runs
+                    WHERE status = 'QUEUED'
+                    """
+                )
+
+                # Сортируем по приоритету инициатора (USER=0, MACHINE=1) и времени постановки (FIFO)
+                sorted_queue = sorted(
+                    queued_rows,
+                    key=lambda r: (
+                        0 if r["initiator"] == "USER" else 1,
+                        r["created_at"],
+                    ),
+                )
+
+                for row in sorted_queue:
+                    # Повторно страхуем приоритет: если в очереди уже есть USER-задачи,
+                    # не пускаем MACHINE-задачи в обход них
+                    if row["initiator"] == "MACHINE":
+                        current_users = await conn.fetchval(
+                            """
+                            SELECT COUNT(*)
+                            FROM runs
+                            WHERE initiator = 'USER'
+                              AND status IN ('RUNNING', 'QUEUED')
+                            """
+                        )
+                        if current_users and current_users > 0:
+                            continue
+
+                    lock_specs = self._registry.get_required_locks(
+                        row["process_id"], row["target_date"]
+                    )
+                    conflicts = await lock_manager.check_conflicts(conn, lock_specs)
+                    if conflicts:
+                        # Ресурсы всё ещё заняты — обновляем причину ожидания и идём к следующей задаче
+                        first = conflicts[0]
+                        owner_short = str(first["run_id"])[:8]
+                        reason = (
+                            f"Ожидание освобождения {first['resource_id']} "
+                            f"({first['date_from']}..{first['date_to']}, владелец #{owner_short})"
+                        )
+                        await conn.execute(
+                            "UPDATE runs SET blocked_reason = $1 WHERE run_id = $2",
+                            reason,
+                            row["run_id"],
+                        )
+                        continue
+
+                    # Конфликтов нет: атомарно захватываем блокировки и переводим в RUNNING
+                    run_id: UUID = row["run_id"]
+                    lock_token = uuid.uuid4()
+                    await lock_manager.acquire_locks(
+
+                        run_id=run_id,
+                        required_locks=lock_specs,
+                        ttl_sec=self._lock_ttl_sec,
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE runs
+                        SET status = 'RUNNING',
+                            lock_token = $1,
+                            blocked_reason = NULL,
+                            started_at = NOW()
+                        WHERE run_id = $2
+                        """,
+                        lock_token,
+                        run_id,
+                    )
+                    await database.log_audit_event(
+                        run_id=run_id,
+                        event_type="STARTED",
+                        message=f"Задача #{str(run_id)[:8]} ({row['process_name']}) запущена из очереди",
+
+                    )
+                    runs_to_launch.append(run_id)
+
+        # Запускаем корутины воркеров вне глобальной блокировки
+        if self._worker_callback is not None:
+            for r_id in runs_to_launch:
+                asyncio.create_task(self._worker_callback(r_id))
+
+        if runs_to_launch:
+            await self._broadcast_state_safe()
+
+    # -------------------------------------------------------------------------
+    # 5. Фоновые циклы: Таймер машины и Watchdog TTL (NFR-02)
+    # -------------------------------------------------------------------------
+
+    async def _machine_timer_loop(self) -> None:
+        """
+        Фоновый цикл таймера регламентных задач (`WAITING_TIMER`).
+
+        Каждые `machine_timer_interval_sec` секунд инициирует проверку очереди,
+        чтобы разбудить машинные задачи, как только пользовательская нагрузка спадёт.
+        """
+        while True:
+            await asyncio.sleep(self._machine_timer_interval_sec)
+            try:
+                await self.process_queue()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Ошибка в фоновом цикле таймера машины: %s", exc)
+
+    async def _watchdog_loop(self) -> None:
+        """
+        Фоновый сторожевой таймер (Watchdog, NFR-02).
+
+        Каждые 2 секунды сканирует таблицу `active_locks` на предмет ключей с истёкшим
+        сроком действия (`expires_at < NOW()`). Если воркер аварийно упал и перестал
+        слать Heartbeat, Watchdog переводит задачу в `FAILED`, принудительно снимает
+        блокировки и пробуждает очередь.
+        """
+        while True:
+            await asyncio.sleep(2)
+            try:
+                expired_found = False
+                async with self._lock:
+                    pool = await database.get_pool()
+                    async with pool.acquire() as conn:
+                        expired_rows = await conn.fetch(
+                            """
+                            SELECT DISTINCT run_id
+                            FROM active_locks
+                            WHERE expires_at < NOW()
+                            """
+                        )
+                        for row in expired_rows:
+                            expired_found = True
+                            stale_run_id: UUID = row["run_id"]
+                            await conn.execute(
+                                """
+                                UPDATE runs
+                                SET status = 'FAILED',
+                                    blocked_reason = 'Превышен TTL блокировки (аварийное завершение воркера / Watchdog)',
+                                    finished_at = NOW()
+                                WHERE run_id = $1
+                                  AND status = 'RUNNING'
+                                """,
+                                stale_run_id,
+                            )
+                            await lock_manager.release_locks(conn, stale_run_id)
+                            await database.log_audit_event(
+                                run_id=stale_run_id,
+                                event_type="TTL_EXPIRED",
+                                message=(
+                                    f"Watchdog принудительно снял блокировки зависшего запуска "
+                                    f"#{str(stale_run_id)[:8]} по истечении TTL ({self._lock_ttl_sec}с)"
+                                ),
+
+                            )
+
+                if expired_found:
+                    await self.process_queue()
+                    await self._broadcast_state_safe()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Ошибка в фоновом цикле Watchdog: %s", exc)
+
+    def start_background_tasks(self) -> None:
+        """Запускает фоновые корутины таймера машины и Watchdog при старте сервера."""
+        if self._bg_tasks:
+            return
+        self._bg_tasks.append(asyncio.create_task(self._machine_timer_loop()))
+        self._bg_tasks.append(asyncio.create_task(self._watchdog_loop()))
+        logger.info(
+            "Фоновые задачи оркестратора запущены (timer=%ss, ttl=%ss)",
+            self._machine_timer_interval_sec,
+            self._lock_ttl_sec,
+        )
+
+    async def stop_background_tasks(self) -> None:
+        """Корректно останавливает все фоновые задачи при завершении работы сервера."""
+        for task in self._bg_tasks:
+            task.cancel()
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        self._bg_tasks.clear()
+
+    # -------------------------------------------------------------------------
+    # 6. Снимок состояния для UI и динамическое обновление настроек (FR-14)
+    # -------------------------------------------------------------------------
+
+    async def get_state_snapshot(self) -> SystemStateSnapshot:
+        """
+        Формирует полный согласованный снимок состояния системы для REST и WebSocket.
+        """
+        pool = await database.get_pool()
+        async with pool.acquire() as conn:
+            active_rows = await conn.fetch(
+                "SELECT * FROM runs WHERE status = 'RUNNING' ORDER BY started_at ASC"
+            )
+            queue_rows = await conn.fetch(
+                """
+                SELECT * FROM runs
+                WHERE status = 'QUEUED'
+                ORDER BY (CASE WHEN initiator = 'USER' THEN 0 ELSE 1 END), created_at ASC
+                """
+            )
+            timer_rows = await conn.fetch(
+                "SELECT * FROM runs WHERE status = 'WAITING_TIMER' ORDER BY created_at ASC"
+            )
+            lock_rows = await conn.fetch(
+                """
+                SELECT lock_id, run_id, resource_id, date_from, date_to, access_mode, expires_at
+                FROM active_locks
+                ORDER BY lock_id ASC
+                """
+            )
+            history_rows = await conn.fetch(
+                """
+                SELECT * FROM runs
+                WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                ORDER BY finished_at DESC NULLS LAST
+                LIMIT 20
+                """
+            )
+            audit_rows = await conn.fetch(
+                """
+                SELECT id, run_id, event_type, message, details, created_at
+                FROM audit_logs
+                ORDER BY id DESC
+                LIMIT 30
+                """
+            )
+
+        active_runs = [self._row_to_run_info(r) for r in active_rows]
+        queue = [self._row_to_run_info(r) for r in queue_rows]
+        timer_waiting = [self._row_to_run_info(r) for r in timer_rows]
+        history = [self._row_to_run_info(r) for r in history_rows]
+        active_locks = [LockInfo(**dict(r)) for r in lock_rows]
+
+        audit_logs: list[dict[str, Any]] = []
+        for r in audit_rows:
+            item = dict(r)
+            if isinstance(item.get("details"), str):
+                item["details"] = json.loads(item["details"])
+            if item.get("run_id") is not None:
+                item["run_id"] = str(item["run_id"])
+            if isinstance(item.get("created_at"), datetime):
+                item["created_at"] = item["created_at"].isoformat()
+            audit_logs.append(item)
+
+        return SystemStateSnapshot(
+            active_runs=active_runs,
+            queue=queue,
+            timer_waiting=timer_waiting,
+            active_locks=active_locks,
+            history=history,
+            audit_logs=audit_logs,
+            config={
+                "machine_timer_interval_sec": self._machine_timer_interval_sec,
+                "lock_ttl_sec": self._lock_ttl_sec,
+                "heartbeat_interval_sec": self._heartbeat_interval_sec,
+            },
+        )
+
+    async def update_config(self, cfg: ConfigUpdateRequest) -> dict[str, int]:
+        """Динамически обновляет интервалы таймера машины, TTL и Heartbeat без перезапуска."""
+        if getattr(cfg, "machine_timer_interval_sec", None) is not None:
+            self._machine_timer_interval_sec = int(cfg.machine_timer_interval_sec)
+        if getattr(cfg, "lock_ttl_sec", None) is not None:
+            self._lock_ttl_sec = int(cfg.lock_ttl_sec)
+        if getattr(cfg, "heartbeat_interval_sec", None) is not None:
+            self._heartbeat_interval_sec = int(cfg.heartbeat_interval_sec)
+
+        self._config.update(
+            {
+                "machine_timer_interval_sec": self._machine_timer_interval_sec,
+                "lock_ttl_sec": self._lock_ttl_sec,
+                "heartbeat_interval_sec": self._heartbeat_interval_sec,
+            }
+        )
+        await self._broadcast_state_safe()
+        return {
+            "machine_timer_interval_sec": self._machine_timer_interval_sec,
+            "lock_ttl_sec": self._lock_ttl_sec,
+            "heartbeat_interval_sec": self._heartbeat_interval_sec,
+        }
+
+=== FILE: backend\core\registry.py ===
+"""Process registry and lock specification utilities.
+
+This module implements a lightweight, file‑backed registry that reads the
+``config/processes.json`` configuration file during initialisation and exposes
+``ProcessRegistry.get_required_locks`` – a pure‑Python method that calculates the
+set of composite lock keys needed to execute a given process for a particular
+``target_date``.
+
+The registry also keeps the configuration in memory and can be refreshed on
+the fly if the underlying file is modified.  This is sufficient for the unit
+tests used in the kata and mirrors the behaviour described in the
+architecture document (section 4.2).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+import json
+import os
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional
+
+__all__ = ["ResourceLockSpec", "ProcessRegistry"]
+
+
+@dataclass(frozen=True)
+class ResourceLockSpec:
+    """Specification of a composite lock.
+
+    Attributes
+    ----------
+    resource_id: str
+        Identifier of the resource – e.g. ``src_transactions``.
+    date_from: date
+        Inclusive start of the date window required by the process.
+    date_to: date
+        Inclusive end of the date window.
+    access_mode: str
+        Either ``"READ"`` or ``"WRITE"``.
+    """
+
+    resource_id: str
+    date_from: date
+    date_to: date
+    access_mode: str
+
+    def __repr__(self) -> str:  # pragma: no cover – trivial
+        return (
+            f"ResourceLockSpec(resource_id={self.resource_id!r}, "
+            f"date_from={self.date_from!r}, date_to={self.date_to!r}, "
+            f"access_mode={self.access_mode!r})"
+        )
+
+
+class ProcessRegistry:
+    """Load ``processes.json`` and compute required lock sets.
+
+    The configuration is loaded lazily during the first call to
+    :py:meth:`get_required_locks`.  Subsequent calls reuse the cached
+    configuration unless the file has been modified – the registry will reload
+    automatically.
+    """
+
+    _config_path: Path
+    _last_mtime: Optional[float]
+    _config: Optional[Dict]
+
+    def __init__(self, config_path: str | Path = "config/processes.json") -> None:
+        self._config_path = Path(config_path)
+        self._last_mtime = None
+        self._config = None
+
+    # ---------------------------------------------------------------------
+    # internal helpers
+    # ---------------------------------------------------------------------
+    def _load_config(self) -> None:
+        """Load JSON configuration from disk.
+
+        The method records the file modification time so that subsequent
+        calls can decide whether a reload is necessary.
+        """
+
+        if not self._config_path.is_file():
+            raise FileNotFoundError(self._config_path)
+        mtime = self._config_path.stat().st_mtime
+        if self._last_mtime is None or mtime != self._last_mtime:
+            with self._config_path.open("r", encoding="utf-8") as fp:
+                self._config = json.load(fp)
+            self._last_mtime = mtime
+
+    # ---------------------------------------------------------------------
+    # public API
+    # ---------------------------------------------------------------------
+    def get_required_locks(
+        self, process_id: str, target_date: date
+    ) -> List[ResourceLockSpec]:
+        """Return a list of :class:`ResourceLockSpec` for ``process_id``.
+
+        Parameters
+        ----------
+        process_id:
+            Identifier of the process as defined in ``processes.json``.
+        target_date:
+            The logical target date of the run – interpreted as the *last*
+            day of the sliding window.
+
+        Returns
+        -------
+        list[ResourceLockSpec]
+            One element per resource described by the process definition.
+        """
+
+        # Load config lazily / reload if needed.
+        self._load_config()
+        if self._config is None:
+            raise RuntimeError("Registry configuration could not be loaded")
+
+        processes = self._config.get("processes", {})
+        proc_cfg = processes.get(process_id)
+        if not proc_cfg:
+            raise KeyError(f"Unknown process_id: {process_id}")
+        window_days: int = int(proc_cfg.get("window_days", 0))
+        if window_days <= 0:
+            raise ValueError(
+                f"Process {process_id!r} has invalid window_days: {window_days}"
+            )
+        # The architecture spec allows either ``target_date - window_days`` or
+        # ``target_date - (window_days-1)``.  We use the latter – it matches the
+        # typical interpretation where the window is inclusive of the target
+        # date.  This behaviour is exercised by the tests in the kata.
+        date_from = target_date - timedelta(days=window_days - 1)
+        date_to = target_date
+
+        resources = proc_cfg.get("resources", [])
+        locks: List[ResourceLockSpec] = []
+        for r in resources:
+            lock = ResourceLockSpec(
+                resource_id=r["resource_id"],
+                date_from=date_from,
+                date_to=date_to,
+                access_mode=r["mode"],
+            )
+            locks.append(lock)
+        return locks
+
+=== FILE: backend\core\worker.py ===
+"""Worker module – исполняет расчётные задачи.
+
+Контролирует Heartbeat, обновляет статус и делает SQL‑операции.
+"""
+
+import asyncio
+import json
+import logging
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+from backend.core import lock_manager
+from backend.db import database
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Chaos‑тест – имитация краха воркера.
+# ---------------------------------------------------------------------------
+CRASHED_WORKERS: set[UUID] = set()
+
+
+def kill_worker(run_id: UUID) -> None:
+    """Добавляет run_id в набор CRASHED_WORKERS."""
+    CRASHED_WORKERS.add(run_id)
+
+
+async def _heartbeat_loop(run_id: UUID, interval_sec: int, ttl_sec: int) -> None:
+    """Периодически продлевает TTL блокировок.
+    Если run_id попал в CRASHED_WORKERS – завершаем цикл."""
+    pool = await database.get_pool()
+    async with pool.acquire() as conn:
+        while run_id not in CRASHED_WORKERS:
+            # Проверяем до и после сна – имитация проверки флага.
+            if run_id in CRASHED_WORKERS:
+                break
+            await asyncio.sleep(interval_sec)
+            if run_id in CRASHED_WORKERS:
+                break
+            try:
+                await lock_manager.extend_ttl(conn, str(run_id), ttl_sec)
+            except Exception as exc:
+                logger.warning("Heartbeat error for %s: %s", run_id, exc)
+
+
+async def update_stage(run_id: UUID, stage: str, progress: int, orchestrator: Any = None) -> None:
+    """Обновляет stage и progress в runs и рассылает состояние."""
+    pool = await database.get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE runs SET stage=$1, progress=$2 WHERE run_id=$3 AND status='RUNNING'",
+            stage,
+            progress,
+            str(run_id),
+        )
+    if orchestrator is not None:
+        await orchestrator._broadcast_state_safe()
+
+
+async def execute_risk_job(run_id: UUID, orchestrator: Any, ws_manager: Any = None) -> None:
+    """Выполняет расчёт по заданному run_id.
+    Читает конфигурацию, запускает Heartbeat и поочерёдно выполняет 4 этапа.
+    """
+    # -----------------------------------------------------------------------
+    # 1. Загружаем метаданные запуска и конфигурацию процесса.
+    # -----------------------------------------------------------------------
+    pool = await database.get_pool()
+    async with pool.acquire() as conn:
+        run_row = await conn.fetchrow(
+            "SELECT process_id, target_date, date_from, date_to FROM runs WHERE run_id=$1",
+            str(run_id),
+        )
+        if run_row is None:
+            logger.error("Run %s not found", run_id)
+            return
+        process_id = run_row["process_id"]
+        target_date = run_row["target_date"]
+        date_from = run_row["date_from"]
+        date_to = run_row["date_to"]
+        # Конфиг процесса
+        config_path: Path = orchestrator._config_path
+        with config_path.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        process_cfg = cfg.get("processes", {}).get(process_id)
+        if not process_cfg:
+            logger.error("Process config not found for %s", process_id)
+            return
+        duration_sec = float(process_cfg.get("duration_sec", 8))
+        step_delay = max(0.2, duration_sec / 4.0)
+        # Запускаем Heartbeat
+        asyncio.create_task(
+            _heartbeat_loop(
+                run_id,
+                orchestrator._heartbeat_interval_sec,
+                orchestrator._lock_ttl_sec,
+            )
+        )
+        # -------------------------------------------------------------------
+        # 2. 4 этапа расчёта
+        # -------------------------------------------------------------------
+        # 2.1 EXTRACT – 20%
+        try:
+            async with conn.transaction(isolation="repeatable_read"):
+                rows = await conn.fetch(
+                    "SELECT t.tx_date, t.amount, c.pd_base "
+                    "FROM src_transactions t JOIN ref_clients c ON t.client_id = c.client_id "
+                    "WHERE t.tx_date BETWEEN $1 AND $2",
+                    date_from,
+                    date_to,
+                )
+            if run_id in CRASHED_WORKERS:
+                await asyncio.sleep(60)
+                return
+            await update_stage(run_id, "EXTRACT", 20, orchestrator)
+            await asyncio.sleep(step_delay)
+            # ----------------------------------------------------------------
+            # 2.2 STAGING – 50%
+            temp_table = f"temp_risk_{run_id.hex}"
+            await conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {temp_table} (amount NUMERIC(14,2), weighted NUMERIC(16,4))"
+            )
+            # Пересчитываем weighted = amount * pd_base
+            data = [(r["amount"], float(r["amount"]) * float(r["pd_base"])) for r in rows]
+            await conn.executemany(
+                f"INSERT INTO {temp_table} (amount, weighted) VALUES ($1, $2)",
+                data,
+            )
+            if run_id in CRASHED_WORKERS:
+                await asyncio.sleep(60)
+                return
+            await update_stage(run_id, "STAGING", 50, orchestrator)
+            await asyncio.sleep(step_delay)
+            # ----------------------------------------------------------------
+            # 2.3 COMPUTE – 80%
+            compute_row = await conn.fetchrow(
+                f"SELECT COUNT(*)::INT AS rows_processed, COALESCE(SUM(amount),0) AS total_exposure, COALESCE(SUM(weighted),0) AS weighted_risk FROM {temp_table}"
+            )
+            if run_id in CRASHED_WORKERS:
+                await asyncio.sleep(60)
+                return
+            await update_stage(run_id, "COMPUTE", 80, orchestrator)
+            await asyncio.sleep(step_delay)
+            # ----------------------------------------------------------------
+            # 2.4 LOAD – 95%
+            await conn.execute(
+                "INSERT INTO mart_risk_results (process_id, target_date, total_exposure, weighted_risk, rows_processed, last_run_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6) "
+                "ON CONFLICT (process_id, target_date) DO UPDATE "
+                "SET total_exposure=EXCLUDED.total_exposure, "
+                "weighted_risk=EXCLUDED.weighted_risk, "
+                "rows_processed=EXCLUDED.rows_processed, "
+                "last_run_id=EXCLUDED.last_run_id, "
+                "updated_at=NOW()",
+                process_id,
+                target_date,
+                compute_row["total_exposure"],
+                compute_row["weighted_risk"],
+                compute_row["rows_processed"],
+                str(run_id),
+            )
+            if run_id in CRASHED_WORKERS:
+                await asyncio.sleep(60)
+                return
+            await update_stage(run_id, "LOAD", 95, orchestrator)
+            await asyncio.sleep(step_delay)
+        except Exception as exc:
+            logger.exception("Error during risk job %s: %s", run_id, exc)
+            await orchestrator.complete_run(run_id, status="FAILED", error=str(exc))
+            return
+        # Завершили успешно
+        await orchestrator.complete_run(run_id, status="COMPLETED")
+
+=== FILE: backend\core\__init__.py ===
+
+=== FILE: backend\db\database.py ===
+"""Database layer for the risk orchestrator.
+
+This module provides a small helper around :mod:`asyncpg` that
+initialises the database schema, seeds synthetic data and offers a simple
+audit logging API.  It is intentionally lightweight – only the parts
+required by the project specification are implemented.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import uuid
+from datetime import datetime, timedelta
+from typing import List, Optional
+
+import asyncpg
+
+__all__ = [
+    "get_pool",
+    "init_db",
+    "seed_synthetic_data",
+    "log_audit_event",
+]
+
+# ---------------------------------------------------------------------------
+# Connection handling
+# ---------------------------------------------------------------------------
+_pool: Optional[asyncpg.Pool] = None
+
+
+async def get_pool() -> asyncpg.Pool:
+    """Return a singleton asyncpg connection pool.
+
+    The connection string is read from the ``DATABASE_URL`` environment
+    variable – this follows the Twelve‑Factor App convention and is
+    sufficient for local test runs (``postgresql://postgres:postgres@localhost:5432/postgres``).
+    """
+
+    global _pool
+    if _pool is None:
+        conn_str = os.getenv(
+            "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
+        )
+        _pool = await asyncpg.create_pool(dsn=conn_str, min_size=1, max_size=10)
+    return _pool
+
+
+async def close_pool() -> None:
+    """Close the global connection pool – useful for tests."""
+    global _pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None
+
+
+# ---------------------------------------------------------------------------
+# Schema definition (DDL) – copied verbatim from ARCHITECTURE.md 5.2
+# ---------------------------------------------------------------------------
+DDL_STEPS: List[str] = [
+    "-- 1. Реестр всех запусков (активных, ждущих и завершённых)",
+    "CREATE TABLE IF NOT EXISTS runs (",
+    "    run_id          UUID PRIMARY KEY,",
+    "    process_id      VARCHAR(64) NOT NULL,",
+    "    process_name    VARCHAR(128) NOT NULL,",
+    "    target_date     DATE NOT NULL,",
+    "    date_from       DATE NOT NULL,          -- target_date - window_days",
+    "    date_to         DATE NOT NULL,          -- target_date",
+    "    initiator       VARCHAR(16) NOT NULL,   -- 'USER' | 'MACHINE'",
+    "    user_name       VARCHAR(64) NOT NULL,",
+    "    status          VARCHAR(32) NOT NULL,   -- 'WAITING_TIMER' | 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'",
+    "    stage           VARCHAR(32),            -- 'EXTRACT' | 'STAGING' | 'COMPUTE' | 'LOAD',",
+    "    progress        INT NOT NULL DEFAULT 0, -- 0..100",
+    "    subscribers     JSONB NOT NULL DEFAULT '[]'::jsonb,",
+    "    blocked_reason  TEXT,                   -- Человекочитаемая причина ожидания для UI (FR-14)",
+    "    lock_token      UUID,",
+    "    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),",
+    "    started_at      TIMESTAMPTZ,",
+    "    finished_at     TIMESTAMPTZ",
+    ");",
+    "",
+    "CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);",
+    "CREATE INDEX IF NOT EXISTS idx_runs_dedup ON runs(process_id, target_date) WHERE status IN ('WAITING_TIMER', 'QUEUED', 'RUNNING');",
+    "",
+    "-- 2. Таблица активных блокировок с поддержкой TTL (NFR-02)",
+    "CREATE TABLE IF NOT EXISTS active_locks (",
+    "    lock_id         SERIAL PRIMARY KEY,",
+    "    run_id          UUID NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,",
+    "    resource_id     VARCHAR(64) NOT NULL,",
+    "    date_from       DATE NOT NULL,",
+    "    date_to         DATE NOT NULL,",
+    "    access_mode     VARCHAR(8) NOT NULL,    -- 'READ' | 'WRITE',",
+    "    expires_at      TIMESTAMPTZ NOT NULL",
+    ");",
+    "",
+    "CREATE INDEX IF NOT EXISTS idx_active_locks_resource ON active_locks(resource_id);",
+    "",
+    "-- 3. Структурированный журнал событий для аудита и ИИ-анализа (NFR-06)",
+    "CREATE TABLE IF NOT EXISTS audit_logs (",
+    "    id              SERIAL PRIMARY KEY,",
+    "    run_id          UUID,",
+    "    event_type      VARCHAR(64) NOT NULL,   -- 'CREATED' | 'DEDUPLICATED' | 'TIMER_WAIT' | 'QUEUED' | 'STARTED' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'TTL_EXPIRED',",
+    "    message         TEXT NOT NULL,",
+    "    details         JSONB NOT NULL DEFAULT '{}'::jsonb,",
+    "    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    ");",
+    "",
+    "-- 4. Синтетические предметные таблицы для работы воркеров (FR-11..FR-13)",
+    "CREATE TABLE IF NOT EXISTS ref_clients (",
+    "    client_id       INT PRIMARY KEY,",
+    "    segment         VARCHAR(32) NOT NULL,",
+    "    pd_base         NUMERIC(6, 4) NOT NULL",
+    ");",
+    "",
+    "CREATE TABLE IF NOT EXISTS src_transactions (",
+    "    tx_id           SERIAL PRIMARY KEY,",
+    "    tx_date         DATE NOT NULL,",
+    "    client_id       INT NOT NULL REFERENCES ref_clients(client_id),",
+    "    amount          NUMERIC(14, 2) NOT NULL",
+    ");",
+    "",
+    "CREATE INDEX IF NOT EXISTS idx_src_tx_date ON src_transactions(tx_date);",
+    "",
+    "CREATE TABLE IF NOT EXISTS mart_risk_results (",
+    "    process_id      VARCHAR(64) NOT NULL,",
+    "    target_date     DATE NOT NULL,",
+    "    total_exposure  NUMERIC(16, 2) NOT NULL,",
+    "    weighted_risk   NUMERIC(10, 4) NOT NULL,",
+    "    rows_processed  INT NOT NULL,",
+    "    last_run_id     UUID NOT NULL,",
+    "    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),",
+    "    PRIMARY KEY (process_id, target_date)",
+    ");",
+]
+
+
+async def init_db() -> None:
+    """Execute the DDL steps and create the database schema.
+
+    The function is idempotent – ``CREATE TABLE IF NOT EXISTS`` ensures that a subsequent
+    call does not error out if the tables already exist.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # DDL_STEPS contains one line per element. Execute statements only when
+        # a line containing a semicolon is reached, which indicates the end of a
+        # SQL statement. This avoids running incomplete statements such as
+        # "CREATE TABLE IF NOT EXISTS runs (".
+        buffer_lines: list[str] = []
+        for line in DDL_STEPS:
+            # Skip full-line comments
+            if line.strip().startswith("--"):
+                continue
+            buffer_lines.append(line)
+            # When a line contains a semicolon, we have a complete statement.
+            if ";" in line:
+                stmt = "\n".join(buffer_lines).strip()
+                if stmt:
+                    await conn.execute(stmt)
+                buffer_lines.clear()
+
+
+# ---------------------------------------------------------------------------
+# Synthetic data seeding
+# ---------------------------------------------------------------------------
+async def seed_synthetic_data() -> None:
+    """Populate ``ref_clients`` and ``src_transactions`` with synthetic rows.
+
+    * 50 clients with random segments and PD values.
+    * 1 500 transactions over the last 30 days.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        client_count = await conn.fetchval("SELECT COUNT(*) FROM ref_clients")
+        if client_count and client_count > 0:
+            return
+        # Create 50 clients
+        clients = [
+            {
+                "client_id": i + 1,
+                "segment": "A" if i % 5 == 0 else "B",
+                "pd_base": round(0.01 + (i % 10) * 0.001, 4),
+            }
+            for i in range(50)
+        ]
+        await conn.executemany(
+            "INSERT INTO ref_clients (client_id, segment, pd_base) VALUES ($1, $2, $3)",
+            [(c["client_id"], c["segment"], c["pd_base"]) for c in clients],
+        )
+        # Generate 1500 transactions for last 30 days
+        today = datetime.utcnow().date()
+        txs = []
+        for _ in range(1500):
+            tx_date = today - timedelta(days=int(os.urandom(1)[0] % 30))
+            client_id = int(os.urandom(1)[0] % 50) + 1
+            amount = round(
+                (os.urandom(1)[0] + 1) * 1000 + (os.urandom(1)[0] % 1000) / 100, 2
+            )
+            txs.append((tx_date, client_id, amount))
+        await conn.executemany(
+            "INSERT INTO src_transactions (tx_date, client_id, amount) VALUES ($1, $2, $3)",
+            txs,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Audit logging
+# ---------------------------------------------------------------------------
+async def log_audit_event(
+    run_id: Optional[str],
+    event_type: str,
+    message: str,
+    details: Optional[dict] = None,
+    *,
+    conn: Optional[asyncpg.Connection] = None,
+):
+    """Insert a row into :table:`audit_logs`.
+
+    Parameters
+    ----------
+    run_id:
+        UUID of the run or ``None`` for global events.
+    event_type:
+        One of the predefined types from the architecture spec.
+    message:
+        Human‑readable text.
+    details:
+        Optional JSON payload.
+    """
+    if conn is not None:
+        await conn.execute(
+            "INSERT INTO audit_logs (run_id, event_type, message, details) VALUES ($1, $2, $3, $4)",
+            run_id,
+            event_type,
+            message,
+            details or {},
+        )
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO audit_logs (run_id, event_type, message, details) VALUES ($1, $2, $3, $4)",
+            run_id,
+            event_type,
+            message,
+            details or {},
+        )
+
+=== FILE: backend\db\models.py ===
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+#  Run creation request sent by the API layer
+# ---------------------------------------------------------------------------
+class RunCreateRequest(BaseModel):
+    """Payload used when creating a new risk run.
+
+    * ``process_id`` – key from :py:data:`config.processes.json`.
+    * ``target_date`` – the date for which the run should be performed.
+    * ``initiator`` – either ``USER`` or ``MACHINE``.
+    * ``user_name`` – name of the requesting user (for UI display).
+    """
+
+    process_id: str
+    target_date: datetime
+    initiator: str = Field(..., pattern=r"^(USER|MACHINE)$")
+    user_name: str
+
+
+# ---------------------------------------------------------------------------
+#  Response for dry‑run endpoint – the same information that would be stored
+#  in ``runs`` but without actually creating a record.
+# ---------------------------------------------------------------------------
+class DryRunResponse(BaseModel):
+    run_id: str
+    status: str
+    estimated_duration_sec: int
+    required_locks: List["LockInfo"]
+    prediction: str
+    date_from: datetime
+    date_to: datetime
+    reason: str
+
+
+# ---------------------------------------------------------------------------
+#  Lock information used by LockManager and API
+# ---------------------------------------------------------------------------
+class LockInfo(BaseModel):
+    resource_id: str
+    date_from: datetime
+    date_to: datetime
+    access_mode: str = Field(..., pattern=r"^(READ|WRITE)$")
+
+
+# ---------------------------------------------------------------------------
+#  Summary of a run – what the API returns after a run is finished.
+# ---------------------------------------------------------------------------
+class RunInfo(BaseModel):
+    run_id: str
+    process_id: str
+    status: str
+    stage: Optional[str]
+    progress: int
+    started_at: Optional[datetime]
+    finished_at: Optional[datetime]
+
+
+# ---------------------------------------------------------------------------
+#  Snapshot of the system state – used by the live‑dashboard endpoint.
+# ---------------------------------------------------------------------------
+class SystemStateSnapshot(BaseModel):
+    active_runs: List[RunInfo]
+    queue: List[RunInfo]
+    timer_waiting: List[RunInfo]
+    active_locks: List[LockInfo]
+    history: List[RunInfo]
+    audit_logs: List[dict[str, Any]]
+    config: dict[str, int]
+
+
+# ---------------------------------------------------------------------------
+#  Payload for dynamic configuration changes via the API.
+# ---------------------------------------------------------------------------
+class ConfigUpdateRequest(BaseModel):
+    machine_timer_interval_sec: Optional[int]
+    lock_ttl_sec: Optional[int]
+    heartbeat_interval_sec: Optional[int]
+
+
+__all__ = [
+    "RunCreateRequest",
+    "DryRunResponse",
+    "RunInfo",
+    "LockInfo",
+    "SystemStateSnapshot",
+    "ConfigUpdateRequest",
+]
+
+=== FILE: backend\main.py ===
+"""Главный модуль FastAPI приложения."""
+import asyncio
+import logging
+from pathlib import Path
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+
+from backend.api.routes import router, ws_router
+from backend.api.ws import ConnectionManager
+from backend.core.orchestrator import Orchestrator
+from backend.core.worker import execute_risk_job
+from backend.db import database
+
+logging.basicConfig(level=logging.INFO)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # При старте приложения
+    await database.init_db()
+    await database.seed_synthetic_data()
+    # Создаём менеджер WebSocket и оркестратор
+    ws_manager = ConnectionManager()
+    orchestrator = Orchestrator(ws_manager=ws_manager)
+    # Привязываем callback к воркеру
+    orchestrator._worker_callback = lambda run_id: asyncio.create_task(
+        execute_risk_job(run_id, orchestrator, ws_manager)
+    )
+    # Сохраняем в состояние приложения
+    app.state.ws_manager = ws_manager
+    app.state.orchestrator = orchestrator
+    orchestrator.start_background_tasks()
+    try:
+        yield
+    finally:
+        # При остановке сервера
+        await orchestrator.stop_background_tasks()
+        await database.close_pool()
+
+
+app = FastAPI(title="Risk Process Orchestrator MVP", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router)
+app.include_router(ws_router)
+
+# Монтируем фронтенд, если он присутствует
+frontend_dir = Path("frontend")
+if frontend_dir.is_dir():
+    app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
+
+index_file = frontend_dir / "index.html"
+
+@app.get("/")
+async def read_index():
+    if index_file.exists():
+        return FileResponse(str(index_file))
+    return JSONResponse(
+        {
+            "service": "Risk Process Orchestrator MVP",
+            "status": "running",
+            "docs": "/docs",
+        }
+    )
+
+=== FILE: backend\__init__.py ===
+
+=== FILE: config\processes.json ===
+{
+  "machine_timer_interval_sec": 15,
+  "lock_ttl_sec": 25,
+  "heartbeat_interval_sec": 3,
+  "processes": {
+    "credit_risk": {
+      "name": "Оценка кредитного риска",
+      "description": "Расчёт PD/LGD по транзакциям за скользящее окно 7 дней",
+      "window_days": 7,
+      "duration_sec": 8,
+      "resources": [
+        { "resource_id": "src_transactions", "mode": "READ" },
+        { "resource_id": "ref_clients", "mode": "READ" },
+        { "resource_id": "mart_credit_risk", "mode": "WRITE" }
+      ]
+    },
+    "counterparty_risk": {
+      "name": "Оценка риска контрагентов",
+      "description": "Анализ лимитов контрагентов (совместное чтение источников с кредитным риском)",
+      "window_days": 7,
+      "duration_sec": 8,
+      "resources": [
+        { "resource_id": "src_transactions", "mode": "READ" },
+        { "resource_id": "ref_clients", "mode": "READ" },
+        { "resource_id": "mart_counterparty_risk", "mode": "WRITE" }
+      ]
+    },
+    "etl_transactions": {
+      "name": "Обновление витрины транзакций (ETL)",
+      "description": "Загрузка и корректировка транзакций за дату (пишет в src_transactions)",
+      "window_days": 1,
+      "duration_sec": 6,
+      "resources": [
+        { "resource_id": "src_transactions", "mode": "WRITE" }
+      ]
+    },
+    "integrated_risk": {
+      "name": "Сводный риск-отчёт (Агрегатор)",
+      "description": "Читает готовые витрины кредитного риска и контрагентов",
+      "window_days": 7,
+      "duration_sec": 6,
+      "resources": [
+        { "resource_id": "mart_credit_risk", "mode": "READ" },
+        { "resource_id": "mart_counterparty_risk", "mode": "READ" },
+        { "resource_id": "mart_integrated_risk", "mode": "WRITE" }
+      ]
+    }
+  }
+}
+=== FILE: frontend\static\app.js ===
+// Скопировано из frontend/app.js – клиентская логика
+window.addEventListener("load", () => {
+    const processSelect = document.getElementById("process-select");
+    const dateInput = document.getElementById("target-date");
+    const wsStatus = document.getElementById("ws-status");
+    const timerIntervalInput = document.getElementById("timer-interval");
+    const runBtn = document.getElementById("run-calculation");
+    const cronBtn = document.getElementById("run-cron");
+    const dedupBtn = document.getElementById("test-deduplication");
+    const hiddenBtn = document.getElementById("hidden-conflict");
+    const analystSelect = document.getElementById("analyst-select");
+    const dryRunDiv = document.getElementById("dry-run");
+
+    let ws;
+    let reconnectTimer;
+
+    const setWsStatus = (text) => wsStatus.textContent = text;
+
+    const connectWs = () => {
+        ws = new WebSocket(`ws://${location.host}/ws/events`);
+        ws.addEventListener("open", () => {
+            setWsStatus("Подключено");
+            if (reconnectTimer) clearInterval(reconnectTimer);
+        });
+        ws.addEventListener("close", () => {
+            setWsStatus("Переподключение");
+            reconnectTimer = setInterval(connectWs, 2000);
+        });
+        ws.addEventListener("message", (e) => {
+            const snap = JSON.parse(e.data);
+            renderState(snap);
+        });
+    };
+
+    const loadProcesses = async () => {
+        const res = await fetch("/api/processes");
+        const list = await res.json();
+        processSelect.innerHTML = '';
+        list.forEach(p => {
+            const opt = document.createElement("option");
+            opt.value = p.id;
+            opt.textContent = p.id;
+            processSelect.appendChild(opt);
+        });
+    };
+    const setToday = () => {
+        const today = new Date().toISOString().split("T")[0];
+        dateInput.value = today;
+    };
+    const payloadFromForm = () => ({
+        process_id: processSelect.value,
+        target_date: dateInput.value,
+        user_name: analystSelect.value,
+        initiator: "USER"
+    });
+
+    const refreshDryRun = async () => {
+        const payload = payloadFromForm();
+        const res = await fetch("/api/runs/dry-run", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        dryRunDiv.innerHTML = `
+            <strong>Прогноз:</strong> ${data.forecast_type}<br>
+            <strong>Диапазон:</strong> ${data.date_range}<br>
+            <strong>Причина:</strong> ${data.reason}
+        `;
+        dryRunDiv.style.color = {
+            RUN_IMMEDIATELY: "green",
+            DEDUPLICATE: "orange",
+            QUEUE: "blue",
+            WAIT_TIMER: "red"
+        }[data.forecast_type] || "black";
+    };
+
+    runBtn.addEventListener("click", async () => {
+        await fetch("/api/runs", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(payloadFromForm())
+        });
+    });
+
+    cronBtn.addEventListener("click", async () => {
+        const params = new URLSearchParams({
+            process_id: processSelect.value,
+            target_date: dateInput.value
+        });
+        await fetch(`/api/demo/trigger-cron?${params.toString()}`);
+    });
+
+    dedupBtn.addEventListener("click", async () => {
+        const base = payloadFromForm();
+        const promises = [
+            fetch("/api/runs", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ ...base, user_name: "Аналитик 1" })
+            }),
+            fetch("/api/runs", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ ...base, user_name: "Аналитик 2" })
+            })
+        ];
+        await Promise.all(promises);
+    });
+
+    hiddenBtn.addEventListener("click", async () => {
+        const payload = payloadFromForm();
+        await fetch("/api/runs", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                process_id: "credit_risk",
+                target_date: "2026-11-20",
+                user_name: payload.user_name,
+                initiator: "USER"
+            })
+        });
+        setTimeout(async () => {
+            await fetch("/api/runs", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    process_id: "etl_transactions",
+                    target_date: "2026-11-19",
+                    user_name: payload.user_name,
+                    initiator: "USER"
+                })
+            });
+        }, 300);
+    });
+
+    document.getElementById("save-interval").addEventListener("click", async () => {
+        const val = parseInt(timerIntervalInput.value, 10);
+        await fetch("/api/config", {
+            method: "PUT",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ machine_timer_interval_sec: val })
+        });
+    });
+
+    const renderState = (snap) => {
+        const runningDiv = document.getElementById("running-cards");
+        runningDiv.innerHTML = '';
+        snap.running.forEach(run => {
+            const card = document.createElement("div");
+            card.className = "run-card";
+            card.innerHTML = `
+                <div><strong>RUNNING ${run.run_id}</strong></div>
+                <div>Прогресс: ${run.progress}%</div>
+                <div>Этап: ${run.stage}</div>
+                <div>Подписчики: ${run.subscribers.join(', ')}</div>
+                <button data-id="${run.run_id}">Убить воркер</button>
+            `;
+            card.querySelector("button").addEventListener("click", () => {
+                fetch(`/api/demo/kill-worker/${run.run_id}`);
+            });
+            runningDiv.appendChild(card);
+        });
+        const queuedDiv = document.getElementById("queued-list");
+        queuedDiv.innerHTML = '';
+        snap.queued.forEach(run => {
+            const item = document.createElement("div");
+            item.className = "queued-item";
+            item.innerHTML = `
+                <div><strong>QUEUED ${run.run_id}</strong></div>
+                <div>Позиция: ${run.position}</div>
+                <div>Инициатор: ${run.initiator}</div>
+                <div>Причина: ${run.blocked_reason}</div>
+                <button data-id="${run.run_id}">Отменить</button>
+            `;
+            item.querySelector("button").addEventListener("click", () => {
+                fetch(`/api/runs/${run.run_id}`, { method: "DELETE" });
+            });
+            queuedDiv.appendChild(item);
+        });
+        document.getElementById("waiting-timer").innerHTML = JSON.stringify(snap.waiting_timer, null, 2);
+        document.getElementById("active-locks").innerHTML = JSON.stringify(snap.active_locks, null, 2);
+        document.getElementById("history").innerHTML = JSON.stringify(snap.history, null, 2);
+        document.getElementById("audit-logs").innerHTML = JSON.stringify(snap.audit_logs, null, 2);
+    };
+
+    loadProcesses();
+    setToday();
+    connectWs();
+    dateInput.addEventListener("change", refreshDryRun);
+    processSelect.addEventListener("change", refreshDryRun);
+    analystSelect.addEventListener("change", refreshDryRun);
+    refreshDryRun();
+});
+=== FILE: frontend\static\styles.css ===
+/* Minimal стили для панели */
+body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+}
+#header {
+    background: #f0f0f0;
+    padding: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+#main {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    padding: 10px;
+}
+.section {
+    margin-bottom: 10px;
+}
+button {
+    margin: 2px;
+}
+/* Карточки */
+.run-card, .queued-item {
+    border: 1px solid #ccc;
+    padding: 5px;
+    margin-bottom: 5px;
+}
+=== FILE: frontend\app.js ===
+// JavaScript для Live‑панели
+// Загрузка списка процессов, даты, состояния, WebSocket и обработка UI
+window.addEventListener("load", () => {
+    const processSelect = document.getElementById("process-select");
+    const dateInput = document.getElementById("target-date");
+    const wsStatus = document.getElementById("ws-status");
+    const timerIntervalInput = document.getElementById("timer-interval");
+    const runBtn = document.getElementById("run-calculation");
+    const cronBtn = document.getElementById("run-cron");
+    const dedupBtn = document.getElementById("test-deduplication");
+    const hiddenBtn = document.getElementById("hidden-conflict");
+    const analystSelect = document.getElementById("analyst-select");
+    const dryRunDiv = document.getElementById("dry-run");
+
+    let ws;
+    let reconnectTimer;
+
+    const setWsStatus = (text) => wsStatus.textContent = text;
+
+    const connectWs = () => {
+        ws = new WebSocket(`ws://${location.host}/ws/events`);
+        ws.addEventListener("open", () => {
+            setWsStatus("Подключено");
+            if (reconnectTimer) clearInterval(reconnectTimer);
+        });
+        ws.addEventListener("close", () => {
+            setWsStatus("Переподключение");
+            reconnectTimer = setInterval(connectWs, 2000);
+        });
+        ws.addEventListener("message", (e) => {
+            const event = JSON.parse(e.data);
+            renderState(event.payload);
+        });
+    };
+
+    // --- UI actions ----------------------------------------
+    const loadProcesses = async () => {
+        const res = await fetch("/api/processes");
+        const list = await res.json();
+        processSelect.innerHTML = '';
+        list.forEach(p => {
+            const opt = document.createElement("option");
+            opt.value = p.id;
+            opt.textContent = p.id;
+            processSelect.appendChild(opt);
+        });
+    };
+    const setToday = () => {
+        const today = new Date().toISOString().split("T")[0];
+        dateInput.value = today;
+    };
+    const payloadFromForm = () => ({
+        process_id: processSelect.value,
+        target_date: dateInput.value,
+        user_name: analystSelect.value,
+        initiator: "USER"
+    });
+
+    const refreshDryRun = async () => {
+        const payload = payloadFromForm();
+        const res = await fetch("/api/runs/dry-run", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        dryRunDiv.innerHTML = `
+            <strong>Прогноз:</strong> ${data.prediction}<br>
+            <strong>Дата начала:</strong> ${data.date_from}<br>
+            <strong>Дата окончания:</strong> ${data.date_to}<br>
+            <strong>Причина:</strong> ${data.reason}
+        `;
+        dryRunDiv.style.color = {
+            RUN_IMMEDIATELY: "green",
+            DEDUPLICATE: "orange",
+            QUEUE: "blue",
+            WAIT_TIMER: "red"
+        }[data.prediction] || "black";
+    };
+
+    runBtn.addEventListener("click", async () => {
+        await fetch("/api/runs", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(payloadFromForm())
+        });
+    });
+
+    cronBtn.addEventListener("click", async () => {
+        const params = new URLSearchParams({
+            process_id: processSelect.value,
+            target_date: dateInput.value
+        });
+        await fetch(`/api/demo/trigger-cron?${params.toString()}`, {method: "POST"});
+    });
+
+    dedupBtn.addEventListener("click", async () => {
+        const base = payloadFromForm();
+        const promises = [
+            fetch("/api/runs", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ ...base, user_name: "Аналитик 1" })
+            }),
+            fetch("/api/runs", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ ...base, user_name: "Аналитик 2" })
+            })
+        ];
+        await Promise.all(promises);
+    });
+
+    hiddenBtn.addEventListener("click", async () => {
+        const payload = payloadFromForm();
+        await fetch("/api/runs", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                process_id: "credit_risk",
+                target_date: "2026-11-20",
+                user_name: payload.user_name,
+                initiator: "USER"
+            })
+        });
+        setTimeout(async () => {
+            await fetch("/api/runs", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    process_id: "etl_transactions",
+                    target_date: "2026-11-19",
+                    user_name: payload.user_name,
+                    initiator: "USER"
+                })
+            });
+        }, 300);
+    });
+
+    document.getElementById("save-interval").addEventListener("click", async () => {
+        const val = parseInt(timerIntervalInput.value, 10);
+        await fetch("/api/config", {
+            method: "PUT",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ machine_timer_interval_sec: val })
+        });
+    });
+
+    // --- Render state -------------------------------------
+    const renderState = (snap) => {
+        // Running
+        const runningDiv = document.getElementById("running-cards");
+        runningDiv.innerHTML = '';
+        snap.active_runs.forEach(run => {
+            const card = document.createElement("div");
+            card.className = "run-card";
+            card.innerHTML = `
+                <div><strong>RUNNING ${run.run_id}</strong></div>
+                <div>Прогресс: ${run.progress}%</div>
+                <div>Этап: ${run.stage}</div>
+                <div>Подписчики: ${run.subscribers.join(', ')}</div>
+                <button data-id="${run.run_id}">Убить воркер</button>
+            `;
+            card.querySelector("button").addEventListener("click", () => {
+                fetch(`/api/demo/kill-worker/${run.run_id}`, {method: "POST"});
+            });
+            runningDiv.appendChild(card);
+        });
+        // Queued
+        const queuedDiv = document.getElementById("queued-list");
+        queuedDiv.innerHTML = '';
+        snap.queue.forEach(run => {
+            const item = document.createElement("div");
+            item.className = "queued-item";
+            item.innerHTML = `
+                <div><strong>QUEUED ${run.run_id}</strong></div>
+                <div>Позиция: ${run.position}</div>
+                <div>Инициатор: ${run.initiator}</div>
+                <div>Причина: ${run.blocked_reason}</div>
+                <button data-id="${run.run_id}">Отменить</button>
+            `;
+            item.querySelector("button").addEventListener("click", () => {
+                fetch(`/api/runs/${run.run_id}`, { method: "DELETE" });
+            });
+            queuedDiv.appendChild(item);
+        });
+        // Waiting timer
+        const timerDiv = document.getElementById("waiting-timer");
+        timerDiv.innerHTML = JSON.stringify(snap.timer_waiting, null, 2);
+        // Active locks
+        const locksDiv = document.getElementById("active-locks");
+        locksDiv.innerHTML = JSON.stringify(snap.active_locks, null, 2);
+        // History
+        const histDiv = document.getElementById("history");
+        histDiv.innerHTML = JSON.stringify(snap.history, null, 2);
+        // Audit logs
+        const auditDiv = document.getElementById("audit-logs");
+        auditDiv.innerHTML = JSON.stringify(snap.audit_logs, null, 2);
+    };
+
+    // --- Init ---------------------------------------------
+    loadProcesses();
+    setToday();
+    connectWs();
+    dateInput.addEventListener("change", refreshDryRun);
+    processSelect.addEventListener("change", refreshDryRun);
+    analystSelect.addEventListener("change", refreshDryRun);
+    // Initial dry-run
+    refreshDryRun();
+});
+
+=== FILE: frontend\index.html ===
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Risk Process Orchestrator MVP</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div id="header">
+        <h1>Risk Process Orchestrator MVP</h1>
+        <span id="ws-status">Переподключение</span>
+        <div id="timer-config">
+            <label>Интервал таймера (сек): <input type="number" id="timer-interval" min="1" value="30"></label>
+            <button id="save-interval">Сохранить</button>
+        </div>
+    </div>
+    <div id="main" class="grid">
+        <div id="left-pane">
+            <h2>Панель запуска и предпроверки (FR-15)</h2>
+            <div class="section">
+                <label>Аналитик:
+                    <select id="analyst-select">
+                        <option>Аналитик 1</option>
+                        <option>Аналитик 2</option>
+                        <option>Риск-менеджер</option>
+                    </select>
+                </label>
+                <label>Процесс:
+                    <select id="process-select">
+                        <option>Process A</option>
+                        <option>Process B</option>
+                    </select>
+                </label>
+                <label>Target Date: <input type="date" id="target-date"></label>
+            </div>
+            <div class="section dry-run" id="dry-run"></div>
+            <button id="run-calculation">Запустить расчёт</button>
+            <div class="section demo-scenarios">
+                <button id="run-cron">Запустить регламент (Cron / MACHINE)</button>
+                <button id="test-deduplication">Тест дедупликации (2 аналитика подряд)</button>
+                <button id="hidden-conflict">Скрытый конфликт окна (20 и 19 число)</button>
+            </div>
+        </div>
+        <div id="right-pane">
+            <h2>Live-мониторинг (FR-14, FR-16)</h2>
+            <div class="section timer-widget" id="waiting-timer"></div>
+            <h3>Активные расчёты (RUNNING)</h3>
+            <div id="running-cards"></div>
+            <h3>Очередь ожидания (QUEUED)</h3>
+            <div id="queued-list"></div>
+            <h3>Активные блокировки (active_locks)</h3>
+            <div id="active-locks"></div>
+            <h3>История запусков (history)</h3>
+            <div id="history"></div>
+            <h3>Журнал аудита (audit_logs)</h3>
+            <div id="audit-logs"></div>
+        </div>
+    </div>
+    <script src="/static/app.js"></script>
+</body>
+</html>
+=== FILE: frontend\styles.css ===
+/* Styles for Risk Process Orchestrator MVP */
+body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#1e1e1e;color:#f0f0f0;}
+#header{background:#333;padding:10px 20px;display:flex;align-items:center;justify-content:space-between;}
+#header h1{font-size:1.5rem;margin:0;}
+#ws-status{font-weight:bold;}
+#timer-config{display:flex;align-items:center;}
+#timer-config label{margin-right:10px;}
+#main{display:grid;grid-template-columns:1fr 2fr;gap:20px;padding:20px;}
+#left-pane, #right-pane{background:#2e2e2e;padding:15px;border-radius:8px;}
+.section{margin-bottom:15px;}
+button{background:#4a90e2;color:white;border:none;padding:5px 10px;border-radius:4px;cursor:pointer;}
+button:hover{background:#357ab8;}
+select,input[type=date],input[type=number]{padding:5px;border-radius:4px;border:1px solid #555;background:#2e2e2e;color:white;}
+.progress{background:#444;height:10px;border-radius:5px;overflow:hidden;}
+.progress-bar{height:100%;background:#4caf50;}
+.status-badge{display:inline-block;padding:2px 6px;border-radius:4px;color:white;font-size:0.8rem;}
+.status-running{background:#4caf50;}
+.status-queued{background:#ff9800;}
+.status-waiting{background:#2196f3;}
+@media(max-width:800px){#main{grid-template-columns:1fr;}#left-pane{order:2;}}
+=== FILE: desktop_app.py ===
+import threading
+import time
+import socket
+import sys
+import uvicorn
+
+def _start_server():
+    # Запускаем FastAPI через uvicorn
+    uvicorn.run("backend.main:app", host="127.0.0.1", port=8000, log_level="info")
+
+def _wait_for_port(host: str, port: int, timeout: int = 10) -> bool:
+    """Ждём, пока указанный порт станет доступным."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except Exception:
+            time.sleep(0.5)
+    return False
+
+def main():
+    # Фоновый поток для uvicorn
+    thread = threading.Thread(target=_start_server, daemon=True)
+    thread.start()
+    if not _wait_for_port("127.0.0.1", 8000):
+        print("❌ Не удалось подключиться к серверу 127.0.0.1:8000")
+        sys.exit(1)
+    # Попытка импортировать pywebview
+    try:
+        import webview
+    except ImportError:
+        print("❌ pywebview не установлен. Установите его: pip install pywebview")
+        sys.exit(1)
+    # Создаём окно
+    webview.create_window("Risk Process Orchestrator MVP", "http://127.0.0.1:8000", width=1360, height=860)
+    webview.start()
+
+
+if __name__ == "__main__":
+    main()
+
+=== FILE: docker-compose.yml ===
+version: '3.8'
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: risk_orchestrator
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://postgres:password@postgres:5432/risk_orchestrator
+      MACHINE_TIMER_INTERVAL_SEC: ${MACHINE_TIMER_INTERVAL_SEC:-15}
+      LOCK_TTL_SEC: ${LOCK_TTL_SEC:-25}
+    ports:
+      - "8000:8000"
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  db_data:
+=== FILE: Dockerfile ===
+# Use Python 3.11-slim as base image
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Copy dependencies file
+COPY requirements.txt .
+
+# Install dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
+COPY . .
+
+# Expose port
+EXPOSE 8000
+
+# Default command
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+=== FILE: requirements.txt ===
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+asyncpg==0.29.0
+pydantic==2.8.2
+httpx==0.27.0
+pytest==8.3.2
+pytest-asyncio==0.23.8

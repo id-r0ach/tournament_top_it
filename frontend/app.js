@@ -151,7 +151,7 @@ window.addEventListener("load", () => {
         // Running
         const runningDiv = document.getElementById("running-cards");
         runningDiv.innerHTML = '';
-        snap.running.forEach(run => {
+        snap.active_runs.forEach(run => {
             const card = document.createElement("div");
             card.className = "run-card";
             card.innerHTML = `
@@ -169,7 +169,7 @@ window.addEventListener("load", () => {
         // Queued
         const queuedDiv = document.getElementById("queued-list");
         queuedDiv.innerHTML = '';
-        snap.queued.forEach(run => {
+        snap.queue.forEach(run => {
             const item = document.createElement("div");
             item.className = "queued-item";
             item.innerHTML = `
@@ -186,7 +186,7 @@ window.addEventListener("load", () => {
         });
         // Waiting timer
         const timerDiv = document.getElementById("waiting-timer");
-        timerDiv.innerHTML = JSON.stringify(snap.waiting_timer, null, 2);
+        timerDiv.innerHTML = JSON.stringify(snap.timer_waiting, null, 2);
         // Active locks
         const locksDiv = document.getElementById("active-locks");
         locksDiv.innerHTML = JSON.stringify(snap.active_locks, null, 2);
