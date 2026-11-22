@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Risk Process Orchestrator MVP</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div id="header">
+        <h1>Risk Process Orchestrator MVP</h1>
+        <span id="ws-status">Переподключение</span>
+        <div id="timer-config">
+            <label>Интервал таймера (сек): <input type="number" id="timer-interval" min="1" value="30"></label>
+            <button id="save-interval">Сохранить</button>
+        </div>
+    </div>
+    <div id="main" class="grid">
+        <div id="left-pane">
+            <h2>Панель запуска и предпроверки (FR-15)</h2>
+            <div class="section">
+                <label>Аналитик:
+                    <select id="analyst-select">
+                        <option>Аналитик 1</option>
+                        <option>Аналитик 2</option>
+                        <option>Риск-менеджер</option>
+                    </select>
+                </label>
+                <label>Процесс:
+                    <select id="process-select">
+                        <option>Process A</option>
+                        <option>Process B</option>
+                    </select>
+                </label>
+                <label>Target Date: <input type="date" id="target-date"></label>
+            </div>
+            <div class="section dry-run" id="dry-run"></div>
+            <button id="run-calculation">Запустить расчёт</button>
+            <div class="section demo-scenarios">
+                <button id="run-cron">Запустить регламент (Cron / MACHINE)</button>
+                <button id="test-deduplication">Тест дедупликации (2 аналитика подряд)</button>
+                <button id="hidden-conflict">Скрытый конфликт окна (20 и 19 число)</button>
+            </div>
+        </div>
+        <div id="right-pane">
+            <h2>Live-мониторинг (FR-14, FR-16)</h2>
+            <div class="section timer-widget" id="waiting-timer"></div>
+            <h3>Активные расчёты (RUNNING)</h3>
+            <div id="running-cards"></div>
+            <h3>Очередь ожидания (QUEUED)</h3>
+            <div id="queued-list"></div>
+            <h3>Активные блокировки (active_locks)</h3>
+            <div id="active-locks"></div>
+            <h3>История запусков (history)</h3>
+            <div id="history"></div>
+            <h3>Журнал аудита (audit_logs)</h3>
+            <div id="audit-logs"></div>
+        </div>
+    </div>
+    <script src="/static/app.js"></script>
+</body>
+</html>
