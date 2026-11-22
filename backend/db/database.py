@@ -39,7 +39,9 @@ async def get_pool() -> asyncpg.Pool:
 
     global _pool
     if _pool is None:
-        conn_str = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
+        conn_str = os.getenv(
+            "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
+        )
         _pool = await asyncpg.create_pool(dsn=conn_str, min_size=1, max_size=10)
     return _pool
 
@@ -140,9 +142,22 @@ async def init_db() -> None:
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        for step in DDL_STEPS:
-            if step.strip():
-                await conn.execute(step)
+        # DDL_STEPS contains one line per element. Execute statements only when
+        # a line containing a semicolon is reached, which indicates the end of a
+        # SQL statement. This avoids running incomplete statements such as
+        # "CREATE TABLE IF NOT EXISTS runs (".
+        buffer_lines: list[str] = []
+        for line in DDL_STEPS:
+            # Skip full-line comments
+            if line.strip().startswith("--"):
+                continue
+            buffer_lines.append(line)
+            # When a line contains a semicolon, we have a complete statement.
+            if ";" in line:
+                stmt = "\n".join(buffer_lines).strip()
+                if stmt:
+                    await conn.execute(stmt)
+                buffer_lines.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +193,9 @@ async def seed_synthetic_data() -> None:
         for _ in range(1500):
             tx_date = today - timedelta(days=int(os.urandom(1)[0] % 30))
             client_id = int(os.urandom(1)[0] % 50) + 1
-            amount = round((os.urandom(1)[0] + 1) * 1000 + (os.urandom(1)[0] % 1000) / 100, 2)
+            amount = round(
+                (os.urandom(1)[0] + 1) * 1000 + (os.urandom(1)[0] % 1000) / 100, 2
+            )
             txs.append((tx_date, client_id, amount))
         await conn.executemany(
             "INSERT INTO src_transactions (tx_date, client_id, amount) VALUES ($1, $2, $3)",

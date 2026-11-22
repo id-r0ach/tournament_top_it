@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
+
 # ---------------------------------------------------------------------------
 #  Run creation request sent by the API layer
 # ---------------------------------------------------------------------------
@@ -20,8 +21,9 @@ class RunCreateRequest(BaseModel):
 
     process_id: str
     target_date: datetime
-    initiator: str = Field(..., regex=r"^(USER|MACHINE)$")
+    initiator: str = Field(..., pattern=r"^(USER|MACHINE)$")
     user_name: str
+
 
 # ---------------------------------------------------------------------------
 #  Response for dry‑run endpoint – the same information that would be stored
@@ -33,6 +35,7 @@ class DryRunResponse(BaseModel):
     estimated_duration_sec: int
     required_locks: List["LockInfo"]
 
+
 # ---------------------------------------------------------------------------
 #  Lock information used by LockManager and API
 # ---------------------------------------------------------------------------
@@ -40,7 +43,8 @@ class LockInfo(BaseModel):
     resource_id: str
     date_from: datetime
     date_to: datetime
-    access_mode: str = Field(..., regex=r"^(READ|WRITE)$")
+    access_mode: str = Field(..., pattern=r"^(READ|WRITE)$")
+
 
 # ---------------------------------------------------------------------------
 #  Summary of a run – what the API returns after a run is finished.
@@ -54,12 +58,14 @@ class RunInfo(BaseModel):
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
 
+
 # ---------------------------------------------------------------------------
 #  Snapshot of the system state – used by the live‑dashboard endpoint.
 # ---------------------------------------------------------------------------
 class SystemStateSnapshot(BaseModel):
     runs: List[RunInfo]
     locks: List[LockInfo]
+
 
 # ---------------------------------------------------------------------------
 #  Payload for dynamic configuration changes via the API.
@@ -68,6 +74,7 @@ class ConfigUpdateRequest(BaseModel):
     machine_timer_interval_sec: Optional[int]
     lock_ttl_sec: Optional[int]
     heartbeat_interval_sec: Optional[int]
+
 
 __all__ = [
     "RunCreateRequest",
