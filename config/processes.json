@@ -1,0 +1,49 @@
+{
+  "machine_timer_interval_sec": 15,
+  "lock_ttl_sec": 25,
+  "heartbeat_interval_sec": 3,
+  "processes": {
+    "credit_risk": {
+      "name": "Оценка кредитного риска",
+      "description": "Расчёт PD/LGD по транзакциям за скользящее окно 7 дней",
+      "window_days": 7,
+      "duration_sec": 8,
+      "resources": [
+        { "resource_id": "src_transactions", "mode": "READ" },
+        { "resource_id": "ref_clients", "mode": "READ" },
+        { "resource_id": "mart_credit_risk", "mode": "WRITE" }
+      ]
+    },
+    "counterparty_risk": {
+      "name": "Оценка риска контрагентов",
+      "description": "Анализ лимитов контрагентов (совместное чтение источников с кредитным риском)",
+      "window_days": 7,
+      "duration_sec": 8,
+      "resources": [
+        { "resource_id": "src_transactions", "mode": "READ" },
+        { "resource_id": "ref_clients", "mode": "READ" },
+        { "resource_id": "mart_counterparty_risk", "mode": "WRITE" }
+      ]
+    },
+    "etl_transactions": {
+      "name": "Обновление витрины транзакций (ETL)",
+      "description": "Загрузка и корректировка транзакций за дату (пишет в src_transactions)",
+      "window_days": 1,
+      "duration_sec": 6,
+      "resources": [
+        { "resource_id": "src_transactions", "mode": "WRITE" }
+      ]
+    },
+    "integrated_risk": {
+      "name": "Сводный риск-отчёт (Агрегатор)",
+      "description": "Читает готовые витрины кредитного риска и контрагентов",
+      "window_days": 7,
+      "duration_sec": 6,
+      "resources": [
+        { "resource_id": "mart_credit_risk", "mode": "READ" },
+        { "resource_id": "mart_counterparty_risk", "mode": "READ" },
+        { "resource_id": "mart_integrated_risk", "mode": "WRITE" }
+      ]
+    }
+  }
+}
