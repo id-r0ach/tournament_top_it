@@ -1,88 +1,132 @@
+"""Pydantic-модели запросов, ответов и снимков состояния оркестратора."""
+
 from __future__ import annotations
 
-from datetime import datetime
-from enum import Enum
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime
+from typing import Any, List, Optional, Union
+from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
-# ---------------------------------------------------------------------------
-#  Run creation request sent by the API layer
-# ---------------------------------------------------------------------------
 class RunCreateRequest(BaseModel):
-    """Payload used when creating a new risk run.
-
-    * ``process_id`` – key from :py:data:`config.processes.json`.
-    * ``target_date`` – the date for which the run should be performed.
-    * ``initiator`` – either ``USER`` or ``MACHINE``.
-    * ``user_name`` – name of the requesting user (for UI display).
-    """
+    """Запрос на запуск расчёта или предпроверку (dry-run)."""
 
     process_id: str
-    target_date: datetime
-    initiator: str = Field(..., pattern=r"^(USER|MACHINE)$")
-    user_name: str
+    target_date: date
+    initiator: str = Field(default="USER", pattern=r"^(USER|MACHINE)$")
+    user_name: str = Field(default="Аналитик 1")
+
+    @field_validator("initiator", mode="before")
+    @classmethod
+    def _normalize_initiator(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().upper()
+        return value
 
 
-# ---------------------------------------------------------------------------
-#  Response for dry‑run endpoint – the same information that would be stored
-#  in ``runs`` but without actually creating a record.
-# ---------------------------------------------------------------------------
-class DryRunResponse(BaseModel):
-    run_id: str
-    status: str
-    estimated_duration_sec: int
-    required_locks: List["LockInfo"]
-    prediction: str
-    date_from: datetime
-    date_to: datetime
-    reason: str
-
-
-# ---------------------------------------------------------------------------
-#  Lock information used by LockManager and API
-# ---------------------------------------------------------------------------
 class LockInfo(BaseModel):
+    """Информация об активной или требуемой композитной блокировке."""
+
+    lock_id: Optional[int] = None
+    run_id: Optional[str] = None
     resource_id: str
-    date_from: datetime
-    date_to: datetime
+    date_from: date
+    date_to: date
     access_mode: str = Field(..., pattern=r"^(READ|WRITE)$")
+    expires_at: Optional[datetime] = None
+
+    @field_validator("run_id", mode="before")
+    @classmethod
+    def _coerce_run_id(cls, value: Any) -> Optional[str]:
+        if isinstance(value, UUID):
+            return str(value)
+        return str(value) if value is not None else None
+
+    @field_validator("access_mode", mode="before")
+    @classmethod
+    def _normalize_mode(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().upper()
+        return value
 
 
-# ---------------------------------------------------------------------------
-#  Summary of a run – what the API returns after a run is finished.
-# ---------------------------------------------------------------------------
+class DryRunResponse(BaseModel):
+    """Результат предпроверки конфликтов без создания задачи (FR-15)."""
+
+    prediction: str
+    date_from: date
+    date_to: date
+    reason: str
+    required_locks: List[LockInfo] = Field(default_factory=list)
+
+
 class RunInfo(BaseModel):
+    """Полное описание запуска для UI и API (соответствует DDL таблицы runs)."""
+
     run_id: str
     process_id: str
+    process_name: str = ""
+    target_date: Optional[date] = None
+    date_from: Optional[date] = None
+    date_to: Optional[date] = None
+    initiator: str = "USER"
+    user_name: str = ""
     status: str
-    stage: Optional[str]
-    progress: int
-    started_at: Optional[datetime]
-    finished_at: Optional[datetime]
+    stage: Optional[str] = None
+    progress: int = 0
+    subscribers: List[str] = Field(default_factory=list)
+    blocked_reason: Optional[str] = None
+    lock_token: Optional[str] = None
+    position: Optional[int] = None
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+    @field_validator("run_id", "lock_token", mode="before")
+    @classmethod
+    def _coerce_uuid(cls, value: Any) -> Optional[str]:
+        if isinstance(value, UUID):
+            return str(value)
+        return str(value) if value is not None else None
 
 
-# ---------------------------------------------------------------------------
-#  Snapshot of the system state – used by the live‑dashboard endpoint.
-# ---------------------------------------------------------------------------
+class AuditLogEntry(BaseModel):
+    """Запись в структурированном журнале audit_logs (NFR-06)."""
+
+    id: Optional[int] = None
+    run_id: Optional[str] = None
+    event_type: str
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[Union[datetime, str]] = None
+
+    @field_validator("run_id", mode="before")
+    @classmethod
+    def _coerce_run_id(cls, value: Any) -> Optional[str]:
+        if isinstance(value, UUID):
+            return str(value)
+        return str(value) if value is not None else None
+
+
 class SystemStateSnapshot(BaseModel):
+    """Снимок состояния системы для REST и WebSocket."""
+
     active_runs: List[RunInfo]
     queue: List[RunInfo]
     timer_waiting: List[RunInfo]
     active_locks: List[LockInfo]
     history: List[RunInfo]
-    audit_logs: List[dict[str, Any]]
+    audit_logs: List[Union[AuditLogEntry, dict[str, Any]]]
     config: dict[str, int]
 
 
-# ---------------------------------------------------------------------------
-#  Payload for dynamic configuration changes via the API.
-# ---------------------------------------------------------------------------
 class ConfigUpdateRequest(BaseModel):
-    machine_timer_interval_sec: Optional[int]
-    lock_ttl_sec: Optional[int]
-    heartbeat_interval_sec: Optional[int]
+    """Динамическое обновление таймингов оркестратора."""
+
+    machine_timer_interval_sec: Optional[int] = Field(default=None, ge=1)
+    lock_ttl_sec: Optional[int] = Field(default=None, ge=5)
+    heartbeat_interval_sec: Optional[int] = Field(default=None, ge=1)
 
 
 __all__ = [
@@ -90,6 +134,7 @@ __all__ = [
     "DryRunResponse",
     "RunInfo",
     "LockInfo",
+    "AuditLogEntry",
     "SystemStateSnapshot",
     "ConfigUpdateRequest",
 ]

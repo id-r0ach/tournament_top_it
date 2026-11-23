@@ -8,9 +8,9 @@
 <body>
     <div id="header">
         <h1>Risk Process Orchestrator MVP</h1>
-        <span id="ws-status">Переподключение</span>
+        <span id="ws-status">Переподключение...</span>
         <div id="timer-config">
-            <label>Интервал таймера (сек): <input type="number" id="timer-interval" min="1" value="30"></label>
+            <label>Интервал таймера (сек): <input type="number" id="timer-interval" min="1" value="15"></label>
             <button id="save-interval">Сохранить</button>
         </div>
     </div>
@@ -20,22 +20,24 @@
             <div class="section">
                 <label>Аналитик:
                     <select id="analyst-select">
-                        <option>Аналитик 1</option>
-                        <option>Аналитик 2</option>
-                        <option>Риск-менеджер</option>
+                        <option value="Аналитик 1">Аналитик 1</option>
+                        <option value="Аналитик 2">Аналитик 2</option>
+                        <option value="Риск-менеджер">Риск-менеджер</option>
                     </select>
                 </label>
+                <br><br>
                 <label>Процесс:
                     <select id="process-select">
-                        <option>Process A</option>
-                        <option>Process B</option>
+                        <option value="">Загрузка...</option>
                     </select>
                 </label>
+                <br><br>
                 <label>Target Date: <input type="date" id="target-date"></label>
             </div>
-            <div class="section dry-run" id="dry-run"></div>
+            <div class="section dry-run" id="dry-run">Проверка конфликтов...</div>
             <button id="run-calculation">Запустить расчёт</button>
-            <div class="section demo-scenarios">
+            <div class="section demo-scenarios" style="margin-top: 15px;">
+                <h3>Демо-сценарии</h3>
                 <button id="run-cron">Запустить регламент (Cron / MACHINE)</button>
                 <button id="test-deduplication">Тест дедупликации (2 аналитика подряд)</button>
                 <button id="hidden-conflict">Скрытый конфликт окна (20 и 19 число)</button>
@@ -43,6 +45,7 @@
         </div>
         <div id="right-pane">
             <h2>Live-мониторинг (FR-14, FR-16)</h2>
+            <h3>Таймер регламентных задач (WAITING_TIMER)</h3>
             <div class="section timer-widget" id="waiting-timer"></div>
             <h3>Активные расчёты (RUNNING)</h3>
             <div id="running-cards"></div>

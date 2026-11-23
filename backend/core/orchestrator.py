@@ -1,27 +1,13 @@
-"""
-Модуль диспетчеризации и оркестрации параллельных расчётов рисков (backend/core/orchestrator.py).
-
-Реализует центральный класс `Orchestrator`, который координирует жизненный цикл
-всех пользовательских и регламентных запусков под единым `asyncio.Lock` (NFR-01, NFR-03):
-1. Предварительная проверка конфликтов без побочных эффектов (`dry_run`, FR-15).
-2. Дедупликация идентичных заявок по паре `(process_id, target_date)` с подпиской
-   инициатора в массив `subscribers` без создания дублирующего воркера (FR-05).
-3. Шлюз приоритетов «Люди vs Машина»: регламентные задачи (`MACHINE`) уступают
-   пользовательским (`USER`) и ожидают в статусе `WAITING_TIMER` (FR-01..FR-03).
-4. Проверка совместимости композитных ключей (`resource_id`, `date_from..date_to`, `access_mode`)
-   через `lock_manager` и постановка конфликтующих задач в FIFO-очередь `QUEUED`
-   без удержания открытых транзакций БД (FR-06..FR-09).
-5. Фоновый таймер регламентных задач (`_machine_timer_loop`) и Watchdog контроля
-   просроченных TTL-блокировок (`_watchdog_loop`, NFR-02).
-"""
+"""Главный диспетчер и оркестратор параллельных процессов оценки рисков."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
@@ -42,48 +28,92 @@ from backend.db.models import (
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "processes.json"
+
 
 class Orchestrator:
-    """Главный диспетчер процессов оценки рисков."""
+    """Координирует жизненный цикл расчётов под единым asyncio.Lock."""
 
     def __init__(
         self,
         worker_callback: Optional[Callable[[UUID], Awaitable[None]]] = None,
         ws_manager: Any = None,
-        config_path: str = "config/processes.json",
+        config_path: str | Path = DEFAULT_CONFIG_PATH,
     ) -> None:
-        """
-        Инициализирует диспетчер, реестр процессов и параметры из конфигурации.
-
-        :param worker_callback: Асинхронная корутина воркера, запускаемая при переходе задачи в RUNNING.
-        :param ws_manager: Менеджер WebSocket-подключений для мгновенной рассылки обновлений UI.
-        :param config_path: Путь к JSON-файлу конфигурации бизнес-процессов.
-        """
         self._worker_callback = worker_callback
         self._ws_manager = ws_manager
         self._config_path = Path(config_path)
 
-        # Единая асинхронная блокировка гарантирует отсутствие гонок при принятии решений (NFR-01, NFR-03)
-        self._lock = asyncio.Lock()
+        self._active_lock: Optional[asyncio.Lock] = None
+        self._active_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._registry = ProcessRegistry(self._config_path)
 
-        # Реестр процессов для расчёта скользящих окон и карт доступа к ресурсам
-        self._registry = ProcessRegistry(str(self._config_path))
-
-        # Загружаем глобальные тайминги из конфигурационного файла
         self._config: dict[str, Any] = self._load_config()
         self._machine_timer_interval_sec: int = int(
-            self._config.get("machine_timer_interval_sec", 15)
+            os.getenv(
+                "MACHINE_TIMER_INTERVAL_SEC",
+                self._config.get("machine_timer_interval_sec", 15),
+            )
         )
-        self._lock_ttl_sec: int = int(self._config.get("lock_ttl_sec", 25))
+        self._lock_ttl_sec: int = int(
+            os.getenv("LOCK_TTL_SEC", self._config.get("lock_ttl_sec", 25))
+        )
         self._heartbeat_interval_sec: int = int(
             self._config.get("heartbeat_interval_sec", 3)
         )
-
-        # Список фоновых корутин (таймер машины и Watchdog)
         self._bg_tasks: list[asyncio.Task[Any]] = []
+        self._worker_tasks: set[asyncio.Task[Any]] = set()
+        self._persist_tasks: set[asyncio.Task[Any]] = set()
+        self._mem_runs: dict[UUID, dict[str, Any]] = {}
+        self._mem_locks: list[dict[str, Any]] = []
+        self._mem_initialized: bool = False
+
+    async def init_memory_cache(self) -> None:
+        """Синхронизирует оперативный кэш с базой данных при старте."""
+        async with self._lock:
+            self._mem_runs.clear()
+            self._mem_locks.clear()
+            pool = await database.get_pool()
+            async with pool.acquire() as conn:
+                runs = await conn.fetch("SELECT * FROM runs WHERE status IN ('WAITING_TIMER', 'QUEUED', 'RUNNING')")
+                for r in runs:
+                    d = dict(r)
+                    subs = d.get("subscribers")
+                    if isinstance(subs, str):
+                        d["subscribers"] = json.loads(subs)
+                    self._mem_runs[d["run_id"]] = d
+                locks = await conn.fetch("SELECT * FROM active_locks WHERE expires_at > NOW()")
+                for l in locks:
+                    self._mem_locks.append(
+                        {
+                            "run_id": l["run_id"],
+                            "resource_id": l["resource_id"],
+                            "date_from": lock_manager._to_date(l["date_from"]),
+                            "date_to": lock_manager._to_date(l["date_to"]),
+                            "access_mode": l["access_mode"].upper(),
+                            "expires_at": l["expires_at"],
+                        }
+                    )
+            self._mem_initialized = True
+
+    def reset_memory_state(self) -> None:
+        """Очищает структуры оперативной памяти для изолированных тестов."""
+        self._mem_runs.clear()
+        self._mem_locks.clear()
+        self._mem_initialized = True
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if getattr(self, "_active_loop", None) is not current_loop or getattr(self, "_active_lock", None) is None:
+            self._active_lock = asyncio.Lock()
+            self._active_loop = current_loop
+        return self._active_lock
 
     def _load_config(self) -> dict[str, Any]:
-        """Считывает базовые настройки оркестратора из config/processes.json."""
         if not self._config_path.exists():
             return {
                 "machine_timer_interval_sec": 15,
@@ -95,26 +125,30 @@ class Orchestrator:
             return json.load(file)
 
     def _get_process_meta(self, process_id: str) -> dict[str, Any]:
-        """Возвращает метаданные процесса из конфига либо выбрасывает ValueError."""
         processes = self._config.get("processes", {})
         if process_id not in processes:
             raise ValueError(f"Неизвестный идентификатор процесса: {process_id}")
         return processes[process_id]
 
     @staticmethod
-    def _row_to_run_info(row: asyncpg.Record | dict[str, Any]) -> RunInfo:
-        """Преобразует строку из таблицы `runs` в Pydantic-модель `RunInfo`."""
+    def _row_to_run_info(
+        row: asyncpg.Record | dict[str, Any],
+        position: Optional[int] = None,
+    ) -> RunInfo:
         data = dict(row)
         raw_subs = data.get("subscribers")
         if isinstance(raw_subs, str):
             data["subscribers"] = json.loads(raw_subs)
         elif raw_subs is None:
             data["subscribers"] = []
+        if position is not None:
+            data["position"] = position
         return RunInfo(**data)
 
     async def _broadcast_state_safe(self) -> None:
-        """Безопасно отправляет актуальный снимок состояния всем подключённым WebSocket-клиентам."""
         if self._ws_manager is None:
+            return
+        if hasattr(self._ws_manager, "active_connections") and not self._ws_manager.active_connections:
             return
         try:
             snapshot = await self.get_state_snapshot()
@@ -122,108 +156,177 @@ class Orchestrator:
         except Exception as exc:
             logger.warning("Ошибка при рассылке состояния по WebSocket: %s", exc)
 
-    # -------------------------------------------------------------------------
-    # 1. Предпроверка конфликтов без создания задачи (Dry-Run, FR-15)
-    # -------------------------------------------------------------------------
-
     async def dry_run(self, request: RunCreateRequest) -> DryRunResponse:
-        """
-        Выполняет симуляцию диспетчеризации без записи в БД и захвата блокировок.
-
-        Позволяет аналитику заранее увидеть, запустится ли процесс сразу,
-        подключится к дублю, встанет в очередь из-за конфликта или уступит пользователям.
-        """
+        """Симулирует диспетчеризацию без записи в БД и захвата блокировок."""
         self._get_process_meta(request.process_id)
         lock_specs: list[ResourceLockSpec] = self._registry.get_required_locks(
             request.process_id, request.target_date
         )
         date_from = lock_specs[0].date_from if lock_specs else request.target_date
         date_to = lock_specs[0].date_to if lock_specs else request.target_date
+        required_lock_models = [
+            LockInfo(
+                resource_id=s.resource_id,
+                date_from=s.date_from,
+                date_to=s.date_to,
+                access_mode=s.access_mode,
+            )
+            for s in lock_specs
+        ]
 
         async with self._lock:
-            pool = await database.get_pool()
-            async with pool.acquire() as conn:
-                # Шаг 1: Проверка на дубликат среди активных и ждущих задач (FR-05)
-                dup_row = await conn.fetchrow(
-                    """
-                    SELECT run_id, status, user_name
-                    FROM runs
-                    WHERE process_id = $1
-                      AND target_date = $2
-                      AND status IN ('WAITING_TIMER', 'QUEUED', 'RUNNING')
-                    ORDER BY created_at ASC
-                    LIMIT 1
-                    """,
-                    request.process_id,
-                    request.target_date,
-                )
-                if dup_row:
-                    short_id = str(dup_row["run_id"])[:8]
+            # 1. Проверяем в оперативной памяти
+            for r in self._mem_runs.values():
+                if (
+                    r["process_id"] == request.process_id
+                    and r["target_date"] == request.target_date
+                    and r["status"] in ("WAITING_TIMER", "QUEUED", "RUNNING")
+                ):
+                    short_id = str(r["run_id"])[:8]
                     return DryRunResponse(
                         prediction="DEDUPLICATE",
                         date_from=date_from,
                         date_to=date_to,
                         reason=(
-                            f"Расчёт уже активен или ожидает (#{short_id}, статус {dup_row['status']}). "
-                            f"Запрос будет присоединён к существующему запуску без дублирования нагрузки."
+                            f"Расчёт уже активен или ожидает (#{short_id}, статус {r['status']}). "
+                            f"Запрос будет присоединён к существующему запуску."
                         ),
+                        required_locks=required_lock_models,
                     )
 
-                # Шаг 2: Шлюз приоритета «Люди vs Машина» (FR-03)
-                if request.initiator == "MACHINE":
-                    user_count = await conn.fetchval(
-                        """
-                        SELECT COUNT(*)
-                        FROM runs
-                        WHERE initiator = 'USER'
-                          AND status IN ('RUNNING', 'QUEUED')
-                        """
-                    )
-                    if user_count and user_count > 0:
-                        return DryRunResponse(
-                            prediction="WAIT_TIMER",
-                            date_from=date_from,
-                            date_to=date_to,
-                            reason=(
-                                f"В системе активны или ожидают {user_count} пользовательских расчётов. "
-                                f"Регламентный запуск будет отложен по таймеру."
-                            ),
-                        )
-
-                # Шаг 3: Проверка пересечений по композитному ключу (Resource + Date_Range + Mode)
-                conflicts = await lock_manager.check_conflicts(conn, lock_specs)
-                if conflicts:
-                    first = conflicts[0]
-                    owner_short = str(first["run_id"])[:8]
+            if request.initiator == "MACHINE":
+                user_count = sum(
+                    1
+                    for r in self._mem_runs.values()
+                    if r["initiator"] == "USER" and r["status"] in ("RUNNING", "QUEUED")
+                )
+                if user_count > 0:
                     return DryRunResponse(
-                        prediction="QUEUE",
+                        prediction="WAIT_TIMER",
                         date_from=date_from,
                         date_to=date_to,
                         reason=(
-                            f"Конфликт {first['req_mode']}/{first['act_mode']} по ресурсу "
-                            f"{first['resource_id']} ({first['date_from']}..{first['date_to']}) "
-                            f"с запуском #{owner_short}"
+                            f"В системе активны или ожидают {user_count} пользовательских задач. "
+                            f"Регламентный запуск будет отложен по таймеру."
                         ),
+                        required_locks=required_lock_models,
                     )
 
-                # Шаг 4: Конфликтов не обнаружено — расчёт стартует мгновенно
+            mem_conflicts = []
+            for req in lock_specs:
+                req_f = lock_manager._to_date(req.date_from)
+                req_t = lock_manager._to_date(req.date_to)
+                req_m = req.access_mode.upper()
+                for act in self._mem_locks:
+                    if req.resource_id != act["resource_id"]:
+                        continue
+                    if not lock_manager._intersects(req_f, req_t, act["date_from"], act["date_to"]):
+                        continue
+                    if req_m == "READ" and act["access_mode"] == "READ":
+                        continue
+                    mem_conflicts.append(
+                        {
+                            "run_id": act["run_id"],
+                            "resource_id": act["resource_id"],
+                            "date_from": act["date_from"],
+                            "date_to": act["date_to"],
+                            "req_mode": req_m,
+                            "act_mode": act["access_mode"],
+                        }
+                    )
+
+            if mem_conflicts:
+                first = mem_conflicts[0]
+                owner_short = str(first["run_id"])[:8]
                 return DryRunResponse(
-                    prediction="RUN_IMMEDIATELY",
+                    prediction="QUEUE",
                     date_from=date_from,
                     date_to=date_to,
-                    reason="Все целевые ресурсы и диапазоны дат свободны. Запуск начнётся немедленно.",
+                    reason=(
+                        f"Конфликт {first['req_mode']}/{first['act_mode']} по ресурсу "
+                        f"{first['resource_id']} ({first['date_from']}..{first['date_to']}) "
+                        f"с запуском #{owner_short}"
+                    ),
+                    required_locks=required_lock_models,
                 )
 
-    # -------------------------------------------------------------------------
-    # 2. Приём и маршрутизация заявки (submit_run, FR-01..FR-09)
-    # -------------------------------------------------------------------------
+            # Если в памяти нет данных и кэш не инициализирован, проверяем в БД (холодный старт)
+            if not self._mem_initialized and not self._mem_runs and not self._mem_locks:
+                pool = await database.get_pool()
+                async with pool.acquire() as conn:
+                    dup_row = await conn.fetchrow(
+                        """
+                        SELECT run_id, status, user_name
+                        FROM runs
+                        WHERE process_id = $1
+                          AND target_date = $2
+                          AND status IN ('WAITING_TIMER', 'QUEUED', 'RUNNING')
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                        """,
+                        request.process_id,
+                        request.target_date,
+                    )
+                    if dup_row:
+                        short_id = str(dup_row["run_id"])[:8]
+                        return DryRunResponse(
+                            prediction="DEDUPLICATE",
+                            date_from=date_from,
+                            date_to=date_to,
+                            reason=(
+                                f"Расчёт уже активен или ожидает (#{short_id}, статус {dup_row['status']}). "
+                                f"Запрос будет присоединён к существующему запуску."
+                            ),
+                            required_locks=required_lock_models,
+                        )
+
+                    if request.initiator == "MACHINE":
+                        user_count = await conn.fetchval(
+                            """
+                            SELECT COUNT(*)
+                            FROM runs
+                            WHERE initiator = 'USER'
+                              AND status IN ('RUNNING', 'QUEUED')
+                            """
+                        )
+                        if user_count and user_count > 0:
+                            return DryRunResponse(
+                                prediction="WAIT_TIMER",
+                                date_from=date_from,
+                                date_to=date_to,
+                                reason=(
+                                    f"В системе активны или ожидают {user_count} пользовательских задач. "
+                                    f"Регламентный запуск будет отложен по таймеру."
+                                ),
+                                required_locks=required_lock_models,
+                            )
+
+                    conflicts = await lock_manager.check_conflicts(conn, lock_specs)
+                    if conflicts:
+                        first = conflicts[0]
+                        owner_short = str(first["run_id"])[:8]
+                        return DryRunResponse(
+                            prediction="QUEUE",
+                            date_from=date_from,
+                            date_to=date_to,
+                            reason=(
+                                f"Конфликт {first['req_mode']}/{first['act_mode']} по ресурсу "
+                                f"{first['resource_id']} ({first['date_from']}..{first['date_to']}) "
+                                f"с запуском #{owner_short}"
+                            ),
+                            required_locks=required_lock_models,
+                        )
+
+            return DryRunResponse(
+                prediction="RUN_IMMEDIATELY",
+                date_from=date_from,
+                date_to=date_to,
+                reason="Все целевые ресурсы и диапазоны дат свободны. Запуск начнётся немедленно.",
+                required_locks=required_lock_models,
+            )
 
     async def submit_run(self, request: RunCreateRequest) -> dict[str, Any]:
-        """
-        Регистрирует новую заявку на расчёт или присоединяет пользователя к существующему дублю.
-
-        Все проверки и захват блокировок выполняются атомарно под `self._lock`.
-        """
+        """Регистрирует заявку, присоединяет к дублю или ставит в очередь/таймер."""
         proc_meta = self._get_process_meta(request.process_id)
         process_name: str = proc_meta.get("name", request.process_id)
         lock_specs: list[ResourceLockSpec] = self._registry.get_required_locks(
@@ -233,201 +336,281 @@ class Orchestrator:
         date_to = lock_specs[0].date_to if lock_specs else request.target_date
 
         run_to_start: Optional[UUID] = None
-        result_payload: dict[str, Any]
+        audit_item: Optional[tuple[Any, ...]] = None
+        is_attached = False
 
         async with self._lock:
+            dup_run: Optional[dict[str, Any]] = None
+            for r in self._mem_runs.values():
+                if (
+                    r["process_id"] == request.process_id
+                    and r["target_date"] == request.target_date
+                    and r["status"] in ("WAITING_TIMER", "QUEUED", "RUNNING")
+                ):
+                    dup_run = r
+                    break
+
+            if dup_run is None and not self._mem_initialized and not self._mem_runs:
+                pool = await database.get_pool()
+                async with pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        """
+                        SELECT * FROM runs
+                        WHERE process_id = $1 AND target_date = $2
+                          AND status IN ('WAITING_TIMER', 'QUEUED', 'RUNNING')
+                        ORDER BY created_at ASC LIMIT 1
+                        """,
+                        request.process_id,
+                        request.target_date,
+                    )
+                    if row:
+                        dup_run = dict(row)
+                        subs = dup_run.get("subscribers")
+                        if isinstance(subs, str):
+                            dup_run["subscribers"] = json.loads(subs)
+                        self._mem_runs[dup_run["run_id"]] = dup_run
+
+            if dup_run is not None:
+                is_attached = True
+                existing_id: UUID = dup_run["run_id"]
+                subscribers: list[str] = dup_run.get("subscribers") or []
+                if isinstance(subscribers, str):
+                    subscribers = json.loads(subscribers)
+                    dup_run["subscribers"] = subscribers
+                if request.user_name not in subscribers:
+                    subscribers.append(request.user_name)
+
+                audit_item = (
+                    existing_id,
+                    "DEDUPLICATED",
+                    f"Заявка от {request.user_name} ({request.initiator}) присоединена к запуску #{str(existing_id)[:8]}",
+                    {
+                        "subscriber": request.user_name,
+                        "initiator": request.initiator,
+                        "process_id": request.process_id,
+                        "target_date": str(request.target_date),
+                    },
+                )
+                run_dict_for_response = dict(dup_run)
+            else:
+                run_id = uuid.uuid4()
+                status = "RUNNING"
+                blocked_reason: Optional[str] = None
+                lock_token: Optional[UUID] = None
+                started_at: Optional[datetime] = None
+
+                if request.initiator == "MACHINE":
+                    user_active = any(
+                        r["initiator"] == "USER" and r["status"] in ("RUNNING", "QUEUED")
+                        for r in self._mem_runs.values()
+                    )
+                    if not user_active and not self._mem_initialized and not self._mem_runs:
+                        pool = await database.get_pool()
+                        async with pool.acquire() as conn:
+                            cnt = await conn.fetchval(
+                                "SELECT COUNT(*) FROM runs WHERE initiator = 'USER' AND status IN ('RUNNING', 'QUEUED')"
+                            )
+                            if cnt and cnt > 0:
+                                user_active = True
+
+                    if user_active:
+                        status = "WAITING_TIMER"
+                        blocked_reason = "Ожидание завершения пользовательских задач"
+
+                if status != "WAITING_TIMER":
+                    conflicts = []
+                    for req in lock_specs:
+                        req_f = lock_manager._to_date(req.date_from)
+                        req_t = lock_manager._to_date(req.date_to)
+                        req_m = req.access_mode.upper()
+                        for act in self._mem_locks:
+                            if req.resource_id != act["resource_id"]:
+                                continue
+                            if not lock_manager._intersects(req_f, req_t, act["date_from"], act["date_to"]):
+                                continue
+                            if req_m == "READ" and act["access_mode"] == "READ":
+                                continue
+                            conflicts.append(
+                                {
+                                    "run_id": act["run_id"],
+                                    "resource_id": act["resource_id"],
+                                    "date_from": act["date_from"],
+                                    "date_to": act["date_to"],
+                                    "req_mode": req_m,
+                                    "act_mode": act["access_mode"],
+                                }
+                            )
+
+                    if not conflicts and not self._mem_initialized and not self._mem_locks:
+                        pool = await database.get_pool()
+                        async with pool.acquire() as conn:
+                            db_confs = await lock_manager.check_conflicts(conn, lock_specs)
+                            if db_confs:
+                                conflicts = db_confs
+
+                    if conflicts:
+                        status = "QUEUED"
+                        first = conflicts[0]
+                        owner_short = str(first["run_id"])[:8]
+                        blocked_reason = (
+                            f"Конфликт {first['req_mode']}/{first['act_mode']} по {first['resource_id']} "
+                            f"({first['date_from']}..{first['date_to']}) с #{owner_short}"
+                        )
+                    else:
+                        status = "RUNNING"
+                        lock_token = uuid.uuid4()
+                        started_at = datetime.now(timezone.utc)
+                        expires_at = started_at + timedelta(seconds=self._lock_ttl_sec)
+                        for s in lock_specs:
+                            self._mem_locks.append(
+                                {
+                                    "run_id": run_id,
+                                    "resource_id": s.resource_id,
+                                    "date_from": lock_manager._to_date(s.date_from),
+                                    "date_to": lock_manager._to_date(s.date_to),
+                                    "access_mode": s.access_mode.upper(),
+                                    "expires_at": expires_at,
+                                }
+                            )
+
+                run_dict_for_response = {
+                    "run_id": run_id,
+                    "process_id": request.process_id,
+                    "process_name": process_name,
+                    "target_date": request.target_date,
+                    "date_from": date_from,
+                    "date_to": date_to,
+                    "initiator": request.initiator,
+                    "user_name": request.user_name,
+                    "status": status,
+                    "stage": None,
+                    "progress": 0,
+                    "subscribers": [request.user_name],
+                    "blocked_reason": blocked_reason,
+                    "lock_token": lock_token,
+                    "created_at": datetime.now(timezone.utc),
+                    "started_at": started_at,
+                    "finished_at": None,
+                }
+                self._mem_runs[run_id] = run_dict_for_response
+
+                if status == "RUNNING":
+                    audit_item = (
+                        run_id,
+                        "STARTED",
+                        f"Создана заявка {process_name} на {request.target_date} ({request.initiator}), статус RUNNING",
+                        {"status": status, "user_name": request.user_name, "locks_count": len(lock_specs)},
+                    )
+                    run_to_start = run_id
+                elif status == "WAITING_TIMER":
+                    audit_item = (
+                        run_id,
+                        "TIMER_WAIT",
+                        blocked_reason or "Переведён в ожидание таймера машины",
+                        {"status": status, "user_name": request.user_name},
+                    )
+                elif status == "QUEUED":
+                    audit_item = (
+                        run_id,
+                        "QUEUED",
+                        blocked_reason or "Поставлен в очередь ожидания ресурсов",
+                        {"status": status, "user_name": request.user_name},
+                    )
+
+        action = "ATTACHED" if is_attached else "CREATED"
+        p_task = asyncio.create_task(
+            self._persist_run_in_db(is_attached, run_dict_for_response, lock_specs, audit_item)
+        )
+        self._persist_tasks.add(p_task)
+        p_task.add_done_callback(self._persist_tasks.discard)
+
+        if run_to_start is not None and self._worker_callback is not None:
+            cb_res = self._worker_callback(run_to_start)
+            if asyncio.iscoroutine(cb_res):
+                w_task = asyncio.create_task(cb_res)
+                self._worker_tasks.add(w_task)
+                w_task.add_done_callback(self._worker_tasks.discard)
+
+        asyncio.create_task(self._broadcast_state_safe())
+        return {
+            "action": action,
+            "run": RunInfo(**run_dict_for_response).model_dump(mode="json"),
+        }
+
+    async def wait_pending_persists(self) -> None:
+        """Ожидает завершения всех фоновых операций персистентности."""
+        tasks = list(self._persist_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._persist_tasks.clear()
+
+    async def _persist_run_in_db(
+        self,
+        is_attached: bool,
+        run_data: dict[str, Any],
+        lock_specs: list[ResourceLockSpec],
+        audit_item: Optional[tuple[Any, ...]],
+    ) -> None:
+        try:
             pool = await database.get_pool()
             async with pool.acquire() as conn:
-                # 1. Дедупликация: ищем идентичный процесс на ту же дату в активных/ждущих статусах
-                dup_row = await conn.fetchrow(
-                    """
-                    SELECT *
-                    FROM runs
-                    WHERE process_id = $1
-                      AND target_date = $2
-                      AND status IN ('WAITING_TIMER', 'QUEUED', 'RUNNING')
-                    ORDER BY created_at ASC
-                    LIMIT 1
-                    """,
-                    request.process_id,
-                    request.target_date,
-                )
-
-                if dup_row:
-                    existing_id: UUID = dup_row["run_id"]
-                    subscribers: list[str] = (
-                        json.loads(dup_row["subscribers"])
-                        if isinstance(dup_row["subscribers"], str)
-                        else list(dup_row["subscribers"] or [])
-                    )
-                    # Добавляем инициатора в список подписчиков, если его там ещё нет
-                    if request.user_name not in subscribers:
-                        subscribers.append(request.user_name)
-
-                    updated_row = await conn.fetchrow(
-                        """
-                        UPDATE runs
-                        SET subscribers = $1::jsonb
-                        WHERE run_id = $2
-                        RETURNING *
-                        """,
-                        json.dumps(subscribers, ensure_ascii=False),
-                        existing_id,
-                    )
-                    await database.log_audit_event(
-                        run_id=existing_id,
-                        event_type="DEDUPLICATED",
-                        message=(
-                            f"Заявка от {request.user_name} ({request.initiator}) присоединена к "
-                            f"активному запуску #{str(existing_id)[:8]}"
-                        ),
-                        details={
-                            "subscriber": request.user_name,
-                            "initiator": request.initiator,
-                            "process_id": request.process_id,
-                            "target_date": str(request.target_date),
-                        },
-                    )
-                    result_payload = {
-                        "action": "ATTACHED",
-                        "run": self._row_to_run_info(updated_row),
-                    }
-                else:
-                    # 2. Создаём новый экземпляр запуска
-                    run_id = uuid.uuid4()
-                    status = "RUNNING"
-                    blocked_reason: Optional[str] = None
-                    lock_token: Optional[UUID] = None
-                    started_at: Optional[datetime] = None
-
-                    # Проверяем приоритет пользователей перед регламентной машиной (FR-03)
-                    if request.initiator == "MACHINE":
-                        user_active_count = await conn.fetchval(
-                            """
-                            SELECT COUNT(*)
-                            FROM runs
-                            WHERE initiator = 'USER'
-                              AND status IN ('RUNNING', 'QUEUED')
-                            """
+                async with conn.transaction():
+                    if is_attached:
+                        await conn.execute(
+                            "UPDATE runs SET subscribers = $1::jsonb WHERE run_id = $2",
+                            json.dumps(run_data["subscribers"], ensure_ascii=False),
+                            run_data["run_id"],
                         )
-                        if user_active_count and user_active_count > 0:
-                            status = "WAITING_TIMER"
-                            blocked_reason = f"Ожидание завершения пользовательских задач ({user_active_count} в работе)"
-
-                    # Если задача не отложена по таймеру машины — проверяем конфликты ресурсов
-                    if status != "WAITING_TIMER":
-                        conflicts = await lock_manager.check_conflicts(conn, lock_specs)
-                        if conflicts:
-                            # По FR-08 ставим в очередь в памяти/БД без открытия рабочих транзакций
-                            status = "QUEUED"
-                            first = conflicts[0]
-                            owner_short = str(first["run_id"])[:8]
-                            blocked_reason = (
-                                f"Конфликт {first['req_mode']}/{first['act_mode']} по {first['resource_id']} "
-                                f"({first['date_from']}..{first['date_to']}) с #{owner_short}"
+                    else:
+                        await conn.execute(
+                            """
+                            INSERT INTO runs (
+                                run_id, process_id, process_name, target_date,
+                                date_from, date_to, initiator, user_name,
+                                status, stage, progress, subscribers,
+                                blocked_reason, lock_token, started_at
                             )
-                        else:
-                            status = "RUNNING"
-                            lock_token = uuid.uuid4()
-                            started_at = datetime.now(timezone.utc)
-
-                    # Вставляем запись о запуске в таблицу `runs`
-                    inserted_row = await conn.fetchrow(
-                        """
-                        INSERT INTO runs (
-                            run_id, process_id, process_name, target_date,
-                            date_from, date_to, initiator, user_name,
-                            status, stage, progress, subscribers,
-                            blocked_reason, lock_token, started_at
+                            VALUES (
+                                $1, $2, $3, $4,
+                                $5, $6, $7, $8,
+                                $9, NULL, 0, $10::jsonb,
+                                $11, $12, $13
+                            )
+                            ON CONFLICT (run_id) DO NOTHING
+                            """,
+                            run_data["run_id"],
+                            run_data["process_id"],
+                            run_data["process_name"],
+                            run_data["target_date"],
+                            run_data["date_from"],
+                            run_data["date_to"],
+                            run_data["initiator"],
+                            run_data["user_name"],
+                            run_data["status"],
+                            json.dumps(run_data["subscribers"], ensure_ascii=False),
+                            run_data["blocked_reason"],
+                            run_data["lock_token"],
+                            run_data["started_at"],
                         )
-                        VALUES (
-                            $1, $2, $3, $4,
-                            $5, $6, $7, $8,
-                            $9, NULL, 0, $10::jsonb,
-                            $11, $12, $13
-                        )
-                        RETURNING *
-                        """,
-                        run_id,
-                        request.process_id,
-                        process_name,
-                        request.target_date,
-                        date_from,
-                        date_to,
-                        request.initiator,
-                        request.user_name,
-                        status,
-                        json.dumps([request.user_name], ensure_ascii=False),
-                        blocked_reason,
-                        lock_token,
-                        started_at,
-                    )
-
-                    await database.log_audit_event(
-                        run_id=run_id,
-                        event_type="CREATED",
-                        message=f"Создана заявка {process_name} на {request.target_date} ({request.initiator})",
-                        details={"status": status, "user_name": request.user_name},
-
-                    )
-
-                    # Если конфликтов нет — атомарно захватываем все ключи и готовим старт воркера
-                    if status == "RUNNING":
-                        await lock_manager.acquire_locks(
-
-                            run_id=run_id,
-                            required_locks=lock_specs,
-                            ttl_sec=self._lock_ttl_sec,
-                        )
-                        await database.log_audit_event(
-                            run_id=run_id,
-                            event_type="STARTED",
-                            message=f"Ресурсы зарезервированы, запуск #{str(run_id)[:8]} переведён в RUNNING",
-                            details={"locks_count": len(lock_specs)},
-
-                        )
-                        run_to_start = run_id
-                    elif status == "WAITING_TIMER":
-                        await database.log_audit_event(
-                            run_id=run_id,
-                            event_type="TIMER_WAIT",
-                            message=blocked_reason
-                            or "Переведён в ожидание таймера машины",
-
-                        )
-                    elif status == "QUEUED":
-                        await database.log_audit_event(
-                            run_id=run_id,
-                            event_type="QUEUED",
-                            message=blocked_reason
-                            or "Поставлен в очередь ожидания ресурсов",
-
-                        )
-
-                    result_payload = {
-                        "action": "CREATED",
-                        "run": self._row_to_run_info(inserted_row),
-                    }
-
-        # Запускаем воркер уже после освобождения self._lock
-        if run_to_start is not None and self._worker_callback is not None:
-            asyncio.create_task(self._worker_callback(run_to_start))
-
-        await self._broadcast_state_safe()
-        return result_payload
-
-    # -------------------------------------------------------------------------
-    # 3. Отмена задачи из очереди или таймера (cancel_run, FR-16)
-    # -------------------------------------------------------------------------
+                        if run_data["status"] == "RUNNING" and lock_specs:
+                            await lock_manager.acquire_locks(
+                                conn=conn,
+                                run_id=run_data["run_id"],
+                                required_locks=lock_specs,
+                                ttl_sec=self._lock_ttl_sec,
+                            )
+                    if audit_item is not None:
+                        await database.log_audit_event(*audit_item, conn=conn)
+        except Exception as exc:
+            logger.exception("Ошибка персистентности задачи %s в БД: %s", run_data.get("run_id"), exc)
 
     async def cancel_run(self, run_id: UUID) -> dict[str, Any]:
-        """
-        Отменяет задачу, находящуюся в статусе `QUEUED` или `WAITING_TIMER`.
-
-        Если задача уже выполняется (`RUNNING`) или завершена, выбрасывает `ValueError`
-        (API вернёт HTTP 409 Conflict).
-        """
+        """Отменяет задачу в статусе QUEUED или WAITING_TIMER."""
+        run_uuid = UUID(str(run_id))
         async with self._lock:
+            if run_uuid in self._mem_runs:
+                self._mem_runs[run_uuid]["status"] = "CANCELLED"
+            self._mem_locks = [l for l in self._mem_locks if l["run_id"] != run_uuid]
             pool = await database.get_pool()
             async with pool.acquire() as conn:
                 row = await conn.fetchrow(
@@ -457,15 +640,12 @@ class Orchestrator:
                     run_id=run_id,
                     event_type="CANCELLED",
                     message=f"Задача #{str(run_id)[:8]} ({row['process_name']}) отменена из {current_status}",
-
+                    conn=conn,
                 )
 
+        await self.process_queue()
         await self._broadcast_state_safe()
         return {"status": "CANCELLED", "run_id": str(run_id)}
-
-    # -------------------------------------------------------------------------
-    # 4. Завершение задачи и пробуждение очереди (complete_run / process_queue, FR-10)
-    # -------------------------------------------------------------------------
 
     async def complete_run(
         self,
@@ -473,11 +653,17 @@ class Orchestrator:
         status: str = "COMPLETED",
         error: Optional[str] = None,
     ) -> None:
-        """
-        Фиксирует завершение воркера (`COMPLETED` или `FAILED`), гарантированно
-        освобождает его блокировки и немедленно запускает пересмотр очереди.
-        """
+        """Фиксирует завершение воркера, освобождает блокировки и пробуждает очередь."""
+        run_uuid = UUID(str(run_id))
         async with self._lock:
+            self._mem_locks = [l for l in self._mem_locks if l["run_id"] != run_uuid]
+            if run_uuid in self._mem_runs:
+                self._mem_runs[run_uuid]["status"] = status
+                self._mem_runs[run_uuid]["blocked_reason"] = error
+                self._mem_runs[run_uuid]["finished_at"] = datetime.now(timezone.utc)
+                if status == "COMPLETED":
+                    self._mem_runs[run_uuid]["progress"] = 100
+
             pool = await database.get_pool()
             async with pool.acquire() as conn:
                 progress_val = 100 if status == "COMPLETED" else 0
@@ -495,9 +681,7 @@ class Orchestrator:
                     error,
                     run_id,
                 )
-                # Гарантированно удаляем все ключи блокировок данного запуска
                 await lock_manager.release_locks(conn, run_id)
-
                 await database.log_audit_event(
                     run_id=run_id,
                     event_type=status,
@@ -506,28 +690,20 @@ class Orchestrator:
                         + (f": {error}" if error else "")
                     ),
                     details={"progress": progress_val},
-
+                    conn=conn,
                 )
 
-        # Пробуждаем ожидающие задачи и рассылаем обновление интерфейса
         await self.process_queue()
         await self._broadcast_state_safe()
 
     async def process_queue(self) -> None:
-        """
-        Пересматривает очередь ожидания и таймер машины (FR-10).
-
-        1. Если в системе не осталось активных/ждущих пользовательских задач (`USER`),
-           переводит регламентные задачи из `WAITING_TIMER` в `QUEUED`.
-        2. Сортирует задачи в `QUEUED` по приоритету (`USER` выше `MACHINE`) и времени
-           создания (`created_at ASC` — FIFO) и запускает все задачи, чьи ресурсы свободны.
-        """
+        """Переводит задачи из таймера при отсутствии USER-задач и запускает свободные из QUEUED."""
         runs_to_launch: list[UUID] = []
+        state_changed = False
 
         async with self._lock:
             pool = await database.get_pool()
             async with pool.acquire() as conn:
-                # Проверяем наличие пользовательских задач в работе или очереди
                 user_active_count = await conn.fetchval(
                     """
                     SELECT COUNT(*)
@@ -537,7 +713,6 @@ class Orchestrator:
                     """
                 )
 
-                # Если пользовательских задач 0 — освобождаем регламентные задачи из таймера
                 if not user_active_count or user_active_count == 0:
                     promoted = await conn.fetch(
                         """
@@ -548,15 +723,16 @@ class Orchestrator:
                         RETURNING run_id
                         """
                     )
+                    if promoted:
+                        state_changed = True
                     for rec in promoted:
                         await database.log_audit_event(
                             run_id=rec["run_id"],
                             event_type="QUEUED",
                             message="Пользовательских задач нет: регламентный запуск переведён из WAITING_TIMER в QUEUED",
-
+                            conn=conn,
                         )
 
-                # Загружаем все задачи, ожидающие в очереди QUEUED
                 queued_rows = await conn.fetch(
                     """
                     SELECT run_id, process_id, process_name, target_date, initiator, created_at
@@ -565,18 +741,12 @@ class Orchestrator:
                     """
                 )
 
-                # Сортируем по приоритету инициатора (USER=0, MACHINE=1) и времени постановки (FIFO)
                 sorted_queue = sorted(
                     queued_rows,
-                    key=lambda r: (
-                        0 if r["initiator"] == "USER" else 1,
-                        r["created_at"],
-                    ),
+                    key=lambda r: (0 if str(r["initiator"]).upper() == "USER" else 1, r["created_at"]),
                 )
 
                 for row in sorted_queue:
-                    # Повторно страхуем приоритет: если в очереди уже есть USER-задачи,
-                    # не пускаем MACHINE-задачи в обход них
                     if row["initiator"] == "MACHINE":
                         current_users = await conn.fetchval(
                             """
@@ -594,7 +764,6 @@ class Orchestrator:
                     )
                     conflicts = await lock_manager.check_conflicts(conn, lock_specs)
                     if conflicts:
-                        # Ресурсы всё ещё заняты — обновляем причину ожидания и идём к следующей задаче
                         first = conflicts[0]
                         owner_short = str(first["run_id"])[:8]
                         reason = (
@@ -608,11 +777,10 @@ class Orchestrator:
                         )
                         continue
 
-                    # Конфликтов нет: атомарно захватываем блокировки и переводим в RUNNING
                     run_id: UUID = row["run_id"]
                     lock_token = uuid.uuid4()
                     await lock_manager.acquire_locks(
-
+                        conn=conn,
                         run_id=run_id,
                         required_locks=lock_specs,
                         ttl_sec=self._lock_ttl_sec,
@@ -633,31 +801,30 @@ class Orchestrator:
                         run_id=run_id,
                         event_type="STARTED",
                         message=f"Задача #{str(run_id)[:8]} ({row['process_name']}) запущена из очереди",
-
+                        conn=conn,
                     )
                     runs_to_launch.append(run_id)
+                    state_changed = True
 
-        # Запускаем корутины воркеров вне глобальной блокировки
         if self._worker_callback is not None:
             for r_id in runs_to_launch:
-                asyncio.create_task(self._worker_callback(r_id))
+                cb_res = self._worker_callback(r_id)
+                if asyncio.iscoroutine(cb_res):
+                    w_task = asyncio.create_task(cb_res)
+                    self._worker_tasks.add(w_task)
+                    w_task.add_done_callback(self._worker_tasks.discard)
 
-        if runs_to_launch:
+        if state_changed:
             await self._broadcast_state_safe()
 
-    # -------------------------------------------------------------------------
-    # 5. Фоновые циклы: Таймер машины и Watchdog TTL (NFR-02)
-    # -------------------------------------------------------------------------
-
     async def _machine_timer_loop(self) -> None:
-        """
-        Фоновый цикл таймера регламентных задач (`WAITING_TIMER`).
-
-        Каждые `machine_timer_interval_sec` секунд инициирует проверку очереди,
-        чтобы разбудить машинные задачи, как только пользовательская нагрузка спадёт.
-        """
+        elapsed = 0
         while True:
-            await asyncio.sleep(self._machine_timer_interval_sec)
+            await asyncio.sleep(1)
+            elapsed += 1
+            if elapsed < self._machine_timer_interval_sec:
+                continue
+            elapsed = 0
             try:
                 await self.process_queue()
             except asyncio.CancelledError:
@@ -666,14 +833,6 @@ class Orchestrator:
                 logger.exception("Ошибка в фоновом цикле таймера машины: %s", exc)
 
     async def _watchdog_loop(self) -> None:
-        """
-        Фоновый сторожевой таймер (Watchdog, NFR-02).
-
-        Каждые 2 секунды сканирует таблицу `active_locks` на предмет ключей с истёкшим
-        сроком действия (`expires_at < NOW()`). Если воркер аварийно упал и перестал
-        слать Heartbeat, Watchdog переводит задачу в `FAILED`, принудительно снимает
-        блокировки и пробуждает очередь.
-        """
         while True:
             await asyncio.sleep(2)
             try:
@@ -691,6 +850,9 @@ class Orchestrator:
                         for row in expired_rows:
                             expired_found = True
                             stale_run_id: UUID = row["run_id"]
+                            self._mem_locks = [l for l in self._mem_locks if l["run_id"] != stale_run_id]
+                            if stale_run_id in self._mem_runs:
+                                self._mem_runs[stale_run_id]["status"] = "FAILED"
                             await conn.execute(
                                 """
                                 UPDATE runs
@@ -707,10 +869,10 @@ class Orchestrator:
                                 run_id=stale_run_id,
                                 event_type="TTL_EXPIRED",
                                 message=(
-                                    f"Watchdog принудительно снял блокировки зависшего запуска "
+                                    f"Watchdog снял блокировки зависшего запуска "
                                     f"#{str(stale_run_id)[:8]} по истечении TTL ({self._lock_ttl_sec}с)"
                                 ),
-
+                                conn=conn,
                             )
 
                 if expired_found:
@@ -722,7 +884,7 @@ class Orchestrator:
                 logger.exception("Ошибка в фоновом цикле Watchdog: %s", exc)
 
     def start_background_tasks(self) -> None:
-        """Запускает фоновые корутины таймера машины и Watchdog при старте сервера."""
+        self._bg_tasks = [t for t in self._bg_tasks if not t.done()]
         if self._bg_tasks:
             return
         self._bg_tasks.append(asyncio.create_task(self._machine_timer_loop()))
@@ -733,22 +895,25 @@ class Orchestrator:
             self._lock_ttl_sec,
         )
 
+    async def cancel_all_workers(self) -> None:
+        """Отменяет все активные задачи воркеров."""
+        tasks = list(self._worker_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._worker_tasks.clear()
+
     async def stop_background_tasks(self) -> None:
-        """Корректно останавливает все фоновые задачи при завершении работы сервера."""
         for task in self._bg_tasks:
             task.cancel()
         if self._bg_tasks:
             await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         self._bg_tasks.clear()
-
-    # -------------------------------------------------------------------------
-    # 6. Снимок состояния для UI и динамическое обновление настроек (FR-14)
-    # -------------------------------------------------------------------------
+        await self.cancel_all_workers()
+        await self.wait_pending_persists()
 
     async def get_state_snapshot(self) -> SystemStateSnapshot:
-        """
-        Формирует полный согласованный снимок состояния системы для REST и WebSocket.
-        """
         pool = await database.get_pool()
         async with pool.acquire() as conn:
             active_rows = await conn.fetch(
@@ -789,7 +954,7 @@ class Orchestrator:
             )
 
         active_runs = [self._row_to_run_info(r) for r in active_rows]
-        queue = [self._row_to_run_info(r) for r in queue_rows]
+        queue = [self._row_to_run_info(r, position=idx) for idx, r in enumerate(queue_rows, start=1)]
         timer_waiting = [self._row_to_run_info(r) for r in timer_rows]
         history = [self._row_to_run_info(r) for r in history_rows]
         active_locks = [LockInfo(**dict(r)) for r in lock_rows]
@@ -820,12 +985,11 @@ class Orchestrator:
         )
 
     async def update_config(self, cfg: ConfigUpdateRequest) -> dict[str, int]:
-        """Динамически обновляет интервалы таймера машины, TTL и Heartbeat без перезапуска."""
-        if getattr(cfg, "machine_timer_interval_sec", None) is not None:
+        if cfg.machine_timer_interval_sec is not None:
             self._machine_timer_interval_sec = int(cfg.machine_timer_interval_sec)
-        if getattr(cfg, "lock_ttl_sec", None) is not None:
+        if cfg.lock_ttl_sec is not None:
             self._lock_ttl_sec = int(cfg.lock_ttl_sec)
-        if getattr(cfg, "heartbeat_interval_sec", None) is not None:
+        if cfg.heartbeat_interval_sec is not None:
             self._heartbeat_interval_sec = int(cfg.heartbeat_interval_sec)
 
         self._config.update(

@@ -28,26 +28,31 @@ class ConnectionManager:
         self.active_connections.discard(websocket)
 
     async def send_state_to_client(self, websocket: WebSocket, state_payload: dict) -> None:
-        """Отправляет клиенту событие обновления состояния."""
+        """Отправляет клиенту событие обновления состояния (раздел 7.2 SDD)."""
+        now_ts = datetime.now(timezone.utc).isoformat()
         event = {
+            "type": "STATE_UPDATE",
             "event": "STATE_UPDATE",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": now_ts,
+            "data": state_payload,
             "payload": state_payload,
         }
         await websocket.send_json(event)
 
     async def broadcast_state(self, state_payload: dict) -> None:
-        """Рассылает обновление всем клиентам, отключая падшие сокеты."""
+        """Рассылает обновление всем клиентам (раздел 7.2 SDD, задержка < 1 сек)."""
+        now_ts = datetime.now(timezone.utc).isoformat()
+        event = {
+            "type": "STATE_UPDATE",
+            "event": "STATE_UPDATE",
+            "timestamp": now_ts,
+            "data": state_payload,
+            "payload": state_payload,
+        }
         disconnected = []
         for ws in list(self.active_connections):
             try:
-                await ws.send_json(
-                    {
-                        "event": "STATE_UPDATE",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "payload": state_payload,
-                    }
-                )
+                await ws.send_json(event)
             except Exception:
                 disconnected.append(ws)
         for ws in disconnected:

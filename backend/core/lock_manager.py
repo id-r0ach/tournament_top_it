@@ -1,20 +1,10 @@
-"""Composite lock manager.
-
-The lock manager implements the conflict rules from section 6.1 of the
-architecture document.  It operates on the ``active_locks`` table defined in
-``backend/db/database.py``.
-
-All public methods are coroutine functions that expect an
-``asyncpg.Connection`` or ``asyncpg.Pool`` from the database layer.  The
-implementation intentionally avoids any application‑specific logic – it
-provides only the primitives required by the orchestrator and unit tests.
-"""
+"""Композитный Lock-менеджер: проверка пересечений (Resource + Date_Range + Mode) и TTL."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Iterable, List
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Iterable, List, Optional, Union
+from uuid import UUID
 
 import asyncpg
 
@@ -28,138 +18,130 @@ __all__ = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
-def _intersects(a_from: datetime, a_to: datetime, b_from: datetime, b_to: datetime) -> bool:
-    """Return ``True`` if two inclusive date ranges overlap."""
+def _to_date(value: Union[date, datetime]) -> date:
+    """Нормализует date/datetime к date."""
+    return value.date() if isinstance(value, datetime) else value
 
+
+def _to_uuid(value: Union[UUID, str]) -> UUID:
+    """Нормализует UUID/str к объекту UUID."""
+    if isinstance(value, UUID):
+        return value
+    return UUID(str(value))
+
+
+def _intersects(a_from: date, a_to: date, b_from: date, b_to: date) -> bool:
+    """Возвращает True, если два включительных интервала дат пересекаются (FR-06)."""
     return a_from <= b_to and b_from <= a_to
 
 
-# ---------------------------------------------------------------------------
-# Lock operations
-# ---------------------------------------------------------------------------
 async def check_conflicts(
-    conn: asyncpg.Connection, required_locks: Iterable[ResourceLockSpec]
-) -> bool:
-    """Return ``True`` if *any* of ``required_locks`` conflicts.
-
-    The function follows the three‑condition rule described in section
-    6.1: matching resource, overlapping date ranges and at least one
-    non‑READ mode.
-
-    Parameters
-    ----------
-    conn:
-        A live :class:`asyncpg.Connection`.
-    required_locks:
-        Iterable of lock specifications requested by a new run.
-    """
-
-    # Pull all *active* locks that involve a resource of interest.  We
-    # filter by ``expires_at`` to avoid stale rows.
-    resource_ids = {lock.resource_id for lock in required_locks}
+    conn: asyncpg.Connection,
+    required_locks: Iterable[ResourceLockSpec],
+    exclude_run_id: Optional[Union[UUID, str]] = None,
+) -> List[dict[str, Any]]:
+    """Проверяет конфликты с активными блокировками (раздел 6.1 SDD)."""
+    req_list = list(required_locks)
+    resource_ids = {lock.resource_id for lock in req_list}
     if not resource_ids:
-        return False
+        return []
 
     sql = """
-    SELECT resource_id, date_from, date_to, access_mode
+    SELECT run_id, resource_id, date_from, date_to, access_mode
     FROM active_locks
-    WHERE resource_id = ANY($1) AND expires_at > NOW()
+    WHERE resource_id = ANY($1)
+      AND expires_at > NOW()
     """
     active = await conn.fetch(sql, list(resource_ids))
     if not active:
-        return False
+        return []
 
-    # Convert active rows to simple tuples for quick comparison.
-    active_locks = [
-        (
-            row["resource_id"],
-            row["date_from"].date(),
-            row["date_to"].date(),
-            row["access_mode"],
-        )
-        for row in active
-    ]
+    exclude_uuid = _to_uuid(exclude_run_id) if exclude_run_id is not None else None
 
-    for req in required_locks:
-        for act in active_locks:
-            if req.resource_id != act[0]:
+    conflicts: List[dict[str, Any]] = []
+    for req in req_list:
+        req_from = _to_date(req.date_from)
+        req_to = _to_date(req.date_to)
+        req_mode = req.access_mode.upper()
+        for row in active:
+            if exclude_uuid is not None and row["run_id"] == exclude_uuid:
                 continue
-            # Check date overlap – inclusive boundaries.
-            if not _intersects(req.date_from, req.date_to, act[1], act[2]):
+            if req.resource_id != row["resource_id"]:
                 continue
-            # Mode compatibility – only READ + READ is allowed.
-            if req.access_mode == "READ" and act[3] == "READ":
+            act_from = _to_date(row["date_from"])
+            act_to = _to_date(row["date_to"])
+            act_mode = str(row["access_mode"]).upper()
+            if not _intersects(req_from, req_to, act_from, act_to):
                 continue
-            # Conflict found.
-            return True
-    return False
+            # Правило несовместимости: параллельно разрешено только READ + READ (FR-07)
+            if req_mode == "READ" and act_mode == "READ":
+                continue
+
+            conflicts.append(
+                {
+                    "run_id": str(row["run_id"]),
+                    "resource_id": row["resource_id"],
+                    "date_from": act_from,
+                    "date_to": act_to,
+                    "req_mode": req_mode,
+                    "act_mode": act_mode,
+                }
+            )
+    return conflicts
 
 
 async def acquire_locks(
     conn: asyncpg.Connection,
-    run_id: str,
+    run_id: Union[UUID, str],
     required_locks: Iterable[ResourceLockSpec],
     ttl_sec: int,
-    *,
-    sync_response_to_workbench: bool = False,
 ) -> None:
-    """Atomically acquire all ``required_locks`` for ``run_id``.
-
-    The caller must call :func:`check_conflicts` first.  The operation is
-    wrapped in a transaction to guarantee the *all‑or‑nothing* property.
-    ``ttl_sec`` determines the initial ``expires_at`` value.
-    """
-
-    # Using a transaction ensures that either all rows are inserted or
-    # none are – which matches the lock‑acquisition semantics.
-    async with conn.transaction():
-        expires_at = datetime.utcnow() + timedelta(seconds=ttl_sec)
-        values: List[tuple] = []
-        for lock in required_locks:
-            values.append(
-                (
-                    run_id,
-                    lock.resource_id,
-                    lock.date_from,
-                    lock.date_to,
-                    lock.access_mode,
-                    expires_at,
-                )
+    """Атомарно резервирует все требуемые блокировки для run_id в одной транзакции (FR-09)."""
+    run_uuid = _to_uuid(run_id)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_sec)
+    values = [
+        (
+            run_uuid,
+            lock.resource_id,
+            _to_date(lock.date_from),
+            _to_date(lock.date_to),
+            lock.access_mode.upper(),
+            expires_at,
+        )
+        for lock in required_locks
+    ]
+    if values:
+        params: list[Any] = []
+        placeholders: list[str] = []
+        for i, row in enumerate(values):
+            offset = i * 6
+            placeholders.append(
+                f"(${offset+1}, ${offset+2}, ${offset+3}, ${offset+4}, ${offset+5}, ${offset+6})"
             )
-        if values:
-            await conn.executemany(
-                """
-                INSERT INTO active_locks (run_id, resource_id, date_from, date_to, access_mode, expires_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                """,
-                values,
-            )
-        # If ``values`` is empty (e.g. a process with no resources) the
-        # transaction does nothing – that's acceptable.
+            params.extend(row)
+        sql = (
+            "INSERT INTO active_locks (run_id, resource_id, date_from, date_to, access_mode, expires_at) VALUES "
+            + ", ".join(placeholders)
+        )
+        await conn.execute(sql, *params)
 
 
-async def release_locks(conn: asyncpg.Connection, run_id: str) -> None:
-    """Remove all locks held by ``run_id``.
-
-    The operation is idempotent – if no rows match the ``run_id`` the
-    statement simply affects zero rows.
-    """
-
-    await conn.execute("DELETE FROM active_locks WHERE run_id = $1", run_id)
+async def release_locks(conn: asyncpg.Connection, run_id: Union[UUID, str]) -> None:
+    """Идемпотентно освобождает все блокировки, удерживаемые запуском run_id."""
+    run_uuid = _to_uuid(run_id)
+    await conn.execute("DELETE FROM active_locks WHERE run_id = $1", run_uuid)
 
 
-async def extend_ttl(conn: asyncpg.Connection, run_id: str, ttl_sec: int) -> None:
-    """Extend the ``expires_at`` timestamp of all locks for ``run_id``.
-
-    The new expiry is calculated relative to the current UTC time.
-    """
-
-    new_expiry = datetime.utcnow() + timedelta(seconds=ttl_sec)
+async def extend_ttl(
+    conn: asyncpg.Connection,
+    run_id: Union[UUID, str],
+    ttl_sec: int,
+) -> None:
+    """Продлевает срок действия (TTL) всех активных блокировок запуска run_id."""
+    run_uuid = _to_uuid(run_id)
+    new_expiry = datetime.now(timezone.utc) + timedelta(seconds=ttl_sec)
     await conn.execute(
         "UPDATE active_locks SET expires_at = $1 WHERE run_id = $2",
         new_expiry,
-        run_id,
+        run_uuid,
     )

@@ -53,6 +53,9 @@ class ResourceLockSpec:
         )
 
 
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "processes.json"
+
+
 class ProcessRegistry:
     """Load ``processes.json`` and compute required lock sets.
 
@@ -66,8 +69,15 @@ class ProcessRegistry:
     _last_mtime: Optional[float]
     _config: Optional[Dict]
 
-    def __init__(self, config_path: str | Path = "config/processes.json") -> None:
-        self._config_path = Path(config_path)
+    def __init__(self, config_path: str | Path | None = None) -> None:
+        if config_path is None:
+            self._config_path = DEFAULT_CONFIG_PATH
+        else:
+            self._config_path = Path(config_path)
+            if not self._config_path.is_file() and not self._config_path.is_absolute():
+                candidate = DEFAULT_CONFIG_PATH.parent.parent / self._config_path
+                if candidate.is_file():
+                    self._config_path = candidate
         self._last_mtime = None
         self._config = None
 
@@ -93,7 +103,7 @@ class ProcessRegistry:
     # public API
     # ---------------------------------------------------------------------
     def get_required_locks(
-        self, process_id: str, target_date: date
+        self, process_id: str, target_date: date | datetime
     ) -> List[ResourceLockSpec]:
         """Return a list of :class:`ResourceLockSpec` for ``process_id``.
 
@@ -125,12 +135,12 @@ class ProcessRegistry:
             raise ValueError(
                 f"Process {process_id!r} has invalid window_days: {window_days}"
             )
-        # The architecture spec allows either ``target_date - window_days`` or
-        # ``target_date - (window_days-1)``.  We use the latter – it matches the
-        # typical interpretation where the window is inclusive of the target
-        # date.  This behaviour is exercised by the tests in the kata.
-        date_from = target_date - timedelta(days=window_days - 1)
-        date_to = target_date
+        target_date_clean: date = (
+            target_date.date() if isinstance(target_date, datetime) else target_date
+        )
+        # target_date - window_days matches SDD section 1.3, section 5.2 and TC-04
+        date_from = target_date_clean - timedelta(days=window_days)
+        date_to = target_date_clean
 
         resources = proc_cfg.get("resources", [])
         locks: List[ResourceLockSpec] = []
@@ -139,7 +149,7 @@ class ProcessRegistry:
                 resource_id=r["resource_id"],
                 date_from=date_from,
                 date_to=date_to,
-                access_mode=r["mode"],
+                access_mode=r["mode"].upper(),
             )
             locks.append(lock)
         return locks

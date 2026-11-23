@@ -17,4 +17,5 @@ select,input[type=date],input[type=number]{padding:5px;border-radius:4px;border:
 .status-running{background:#4caf50;}
 .status-queued{background:#ff9800;}
 .status-waiting{background:#2196f3;}
+.demo-scenarios button{display:block;width:100%;margin-top:8px;}
 @media(max-width:800px){#main{grid-template-columns:1fr;}#left-pane{order:2;}}
