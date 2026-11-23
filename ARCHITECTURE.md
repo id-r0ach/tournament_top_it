@@ -50,9 +50,9 @@
  | `UR-03`, `FR-04`, `FR-05`
 
  |
-| **BN-04** + Инсайт ИИ №2 (Скрытые конфликты скользящих окон `target_date - 7 days`)
+| **BN-04** + Инсайт ИИ №2 (Скрытые конфликты скользящих окон `target_date - (window_days - 1)`)
 
- | Расчёты за 20.11 и 19.11 пересекаются по историческому окну 14.11–19.11 и вызывают Deadlock.
+ | Расчёты за 20.11 (окно 14.11–20.11) и 19.11 (окно 19.11–19.11) пересекаются по историческому окну транзакций и вызывают Deadlock.
 
  | **Композитный Lock-менеджер:** проверка пересечений по ключу `(Resource_ID + Date_Range + Access_Mode)` и атомарный захват «всё или ничего».
 
@@ -326,7 +326,7 @@ CREATE TABLE IF NOT EXISTS runs (
     process_id      VARCHAR(64) NOT NULL,
     process_name    VARCHAR(128) NOT NULL,
     target_date     DATE NOT NULL,
-    date_from       DATE NOT NULL,          -- target_date - window_days
+    date_from       DATE NOT NULL,          -- target_date - (window_days - 1)
     date_to         DATE NOT NULL,          -- target_date
     initiator       VARCHAR(16) NOT NULL,   -- 'USER' | 'MACHINE'
     user_name       VARCHAR(64) NOT NULL,
@@ -481,9 +481,8 @@ async def execute_risk_job(run_id: UUID):
     heartbeat_task = asyncio.create_task(_heartbeat_loop(run_id))
     temp_table = f"temp_risk_{run_id.hex}"
     try:
+        # Шаг 1: EXTRACT в режиме Snapshot Isolation / MVCC (FR-11)
         async with pool.acquire() as conn:
-            # Шаг 1: EXTRACT в режиме Snapshot Isolation / MVCC (FR-11)
-            await update_stage(run_id, stage="EXTRACT", progress=20)
             async with conn.transaction(isolation="repeatable_read"):
                 rows = await conn.fetch(
                     "SELECT t.tx_date, t.amount, c.pd_base FROM src_transactions t "
@@ -491,26 +490,30 @@ async def execute_risk_job(run_id: UUID):
                     "WHERE t.tx_date BETWEEN $1 AND $2",
                     date_from, date_to
                 )
-                await asyncio.sleep(step_delay)
+        # Соединение освобождено сразу после чтения; пауза без удержания транзакции и коннекта
+        await update_stage(run_id, stage="EXTRACT", progress=20)
+        await asyncio.sleep(step_delay)
 
-            # Шаг 2: STAGING в персональной буферной таблице (FR-12)
-            await update_stage(run_id, stage="STAGING", progress=50)
+        # Шаг 2: STAGING в персональной буферной таблице (FR-12)
+        async with pool.acquire() as conn:
             await conn.execute(f"CREATE TABLE {temp_table} (amount NUMERIC, weighted NUMERIC)")
             await conn.executemany(
                 f"INSERT INTO {temp_table} VALUES ($1, $2)",
                 [(r["amount"], r["amount"] * r["pd_base"]) for r in rows]
             )
-            await asyncio.sleep(step_delay)
+        await update_stage(run_id, stage="STAGING", progress=50)
+        await asyncio.sleep(step_delay)
 
-            # Шаг 3: COMPUTE агрегация метрик риска
-            await update_stage(run_id, stage="COMPUTE", progress=80)
+        # Шаг 3: COMPUTE агрегация метрик риска
+        async with pool.acquire() as conn:
             agg = await conn.fetchrow(
                 f"SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS exp, COALESCE(SUM(weighted),0) AS risk FROM {temp_table}"
             )
-            await asyncio.sleep(step_delay)
+        await update_stage(run_id, stage="COMPUTE", progress=80)
+        await asyncio.sleep(step_delay)
 
-            # Шаг 4: LOAD атомарный MERGE в целевую витрину (FR-13)
-            await update_stage(run_id, stage="LOAD", progress=95)
+        # Шаг 4: LOAD атомарный MERGE в целевую витрину (FR-13)
+        async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO mart_risk_results (process_id, target_date, total_exposure, weighted_risk, rows_processed, last_run_id, updated_at)
@@ -524,7 +527,8 @@ async def execute_risk_job(run_id: UUID):
                 """,
                 process_id, target_date, agg["exp"], agg["risk"], agg["cnt"], run_id
             )
-            await asyncio.sleep(step_delay)
+        await update_stage(run_id, stage="LOAD", progress=95)
+        await asyncio.sleep(step_delay)
 
         await orchestrator.complete_run(run_id, status="COMPLETED")
     except Exception as exc:
@@ -549,7 +553,7 @@ async def execute_risk_job(run_id: UUID):
 
  | **Req:** `{"process_id": "etl_transactions", "target_date": "2026-11-19", "initiator": "USER"}`<br>
 
-<br>**Res `200`:** `{"prediction": "QUEUE", "date_from": "2026-11-18", "date_to": "2026-11-19", "reason": "Конфликт WRITE/READ по src_transactions (18.11–19.11) с запуском #8f14c2"}`<br>
+<br>**Res `200`:** `{"prediction": "QUEUE", "date_from": "2026-11-19", "date_to": "2026-11-19", "reason": "Конфликт WRITE/READ по src_transactions (19.11–19.11) с запуском #8f14c2"}`<br>
 
 <br>*(Значения `prediction`: `RUN_IMMEDIATELY`, `DEDUPLICATE`, `QUEUE`, `WAIT_TIMER`)* |
 | `POST /api/runs` | Создание или подключение к запуску (`FR-01`..`FR-09`)
@@ -640,7 +644,7 @@ async def execute_risk_job(run_id: UUID):
  |
 | **TC-04** | Скрытый конфликт скользящего окна (Инсайт ИИ №2)
 
- | Запустить `credit_risk` на `2026-11-20` (окно `13.11–20.11`, `READ src_transactions`), затем `etl_transactions` на `2026-11-19` (окно `18.11–19.11`, `WRITE src_transactions`). | `etl_transactions` автоматически встаёт в `QUEUED` из-за пересечения интервала `18.11–19.11` и стартует только после завершения `credit_risk`.
+ | Запустить `credit_risk` на `2026-11-20` (окно `14.11–20.11`, `READ src_transactions`), затем `etl_transactions` на `2026-11-19` (окно `19.11–19.11`, `WRITE src_transactions`). | `etl_transactions` автоматически встаёт в `QUEUED` из-за пересечения интервала `19.11–19.11` и стартует только после завершения `credit_risk`.
 
  |
 | **TC-05** | Приоритет «Люди vs Машина» (`FR-03`)

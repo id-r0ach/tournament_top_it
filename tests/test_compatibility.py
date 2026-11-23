@@ -47,20 +47,33 @@ def test_registry_sliding_windows():
     """Проверка корректности скользящих окон (раздел 1.3 и 5.1)."""
     reg = ProcessRegistry()
     locks_credit = reg.get_required_locks("credit_risk", date(2026, 11, 20))
-    # 7 дней скользящего окна: 2026-11-20 - 7 дней = 2026-11-13 .. 2026-11-20
-    assert locks_credit[0].date_from == date(2026, 11, 13)
-    assert locks_credit[0].date_to == date(2026, 11, 20)
+    # 7 дней скользящего окна: 2026-11-20 - (7 - 1) = 2026-11-14 .. 2026-11-20
+    src_lock = next(l for l in locks_credit if l.resource_id == "src_transactions")
+    assert src_lock.date_from == date(2026, 11, 14)
+    assert src_lock.date_to == date(2026, 11, 20)
+    assert src_lock.access_mode == "READ"
+
+    # Выходная витрина mart_credit_risk (WRITE): точечный интервал target_date..target_date
+    mart_lock = next(l for l in locks_credit if l.resource_id == "mart_credit_risk")
+    assert mart_lock.date_from == date(2026, 11, 20)
+    assert mart_lock.date_to == date(2026, 11, 20)
+    assert mart_lock.access_mode == "WRITE"
 
     locks_etl = reg.get_required_locks("etl_transactions", date(2026, 11, 19))
-    # 1 день скользящего окна: 2026-11-19 - 1 день = 2026-11-18 .. 2026-11-19
-    assert locks_etl[0].date_from == date(2026, 11, 18)
-    assert locks_etl[0].date_to == date(2026, 11, 19)
+    # 1 день скользящего окна: 2026-11-19 - (1 - 1) = 2026-11-19 .. 2026-11-19
+    etl_lock = locks_etl[0]
+    assert etl_lock.date_from == date(2026, 11, 19)
+    assert etl_lock.date_to == date(2026, 11, 19)
+    assert etl_lock.access_mode == "WRITE"
 
 
 def test_lock_manager_intersection_logic():
     """Проверка формального правила пересечения интервалов (раздел 6.1)."""
-    # Интервалы [13.11..20.11] и [18.11..19.11] пересекаются
-    assert _intersects(date(2026, 11, 13), date(2026, 11, 20), date(2026, 11, 18), date(2026, 11, 19)) is True
+    # Интервалы [14.11..20.11] и [19.11..19.11] пересекаются
+    assert _intersects(date(2026, 11, 14), date(2026, 11, 20), date(2026, 11, 19), date(2026, 11, 19)) is True
+
+    # Соседние даты витрин [19.11..19.11] и [20.11..20.11] НЕ пересекаются
+    assert _intersects(date(2026, 11, 19), date(2026, 11, 19), date(2026, 11, 20), date(2026, 11, 20)) is False
 
     # Интервалы [01.11..05.11] и [06.11..10.11] НЕ пересекаются
     assert _intersects(date(2026, 11, 1), date(2026, 11, 5), date(2026, 11, 6), date(2026, 11, 10)) is False
@@ -158,6 +171,46 @@ async def test_tc02_buffer_isolation(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_parallel_credit_risk_adjacent_dates(client: AsyncClient):
+    """Параллельный запуск credit_risk на соседние даты (2026-11-19 и 2026-11-20).
+
+    Благодаря точечному интервалу для mart_credit_risk (WRITE) и совместимости READ+READ
+    по src_transactions и ref_clients, оба процесса должны сразу перейти в RUNNING.
+    """
+    if not await is_db_available():
+        pytest.skip("PostgreSQL недоступен. Запустите docker-compose up для интеграционных тестов.")
+
+    r1, r2 = await asyncio.gather(
+        client.post(
+            "/api/runs",
+            json={
+                "process_id": "credit_risk",
+                "target_date": "2026-11-19",
+                "user_name": "Аналитик 1",
+                "initiator": "USER",
+            },
+        ),
+        client.post(
+            "/api/runs",
+            json={
+                "process_id": "credit_risk",
+                "target_date": "2026-11-20",
+                "user_name": "Аналитик 2",
+                "initiator": "USER",
+            },
+        ),
+    )
+    assert r1.status_code == 200 and r2.status_code == 200
+    d1, d2 = r1.json(), r2.json()
+
+    assert d1["action"] == "CREATED"
+    assert d2["action"] == "CREATED"
+    assert d1["run"]["status"] == "RUNNING"
+    assert d2["run"]["status"] == "RUNNING"
+    assert d1["run"]["run_id"] != d2["run"]["run_id"]
+
+
+@pytest.mark.asyncio
 async def test_tc03_concurrent_read_read(client: AsyncClient):
     """TC-03: Совместное чтение READ+READ (FR-07)
 
@@ -198,14 +251,14 @@ async def test_tc03_concurrent_read_read(client: AsyncClient):
 async def test_tc04_sliding_window_conflict(client: AsyncClient):
     """TC-04: Скрытый конфликт скользящего окна (Инсайт ИИ №2)
 
-    Запустить credit_risk на 2026-11-20 (окно 13.11–20.11, READ src_transactions),
-    затем etl_transactions на 2026-11-19 (окно 18.11–19.11, WRITE src_transactions).
+    Запустить credit_risk на 2026-11-20 (окно 14.11–20.11, READ src_transactions),
+    затем etl_transactions на 2026-11-19 (окно 19.11–19.11, WRITE src_transactions).
     Ожидаемый результат: etl_transactions встаёт в QUEUED из-за пересечения интервалов.
     """
     if not await is_db_available():
         pytest.skip("PostgreSQL недоступен. Запустите docker-compose up для интеграционных тестов.")
 
-    # 1. Запуск credit_risk (читает src_transactions с 13.11 по 20.11)
+    # 1. Запуск credit_risk (читает src_transactions с 14.11 по 20.11)
     r1 = await client.post(
         "/api/runs",
         json={
@@ -233,7 +286,7 @@ async def test_tc04_sliding_window_conflict(client: AsyncClient):
     assert dry_data["prediction"] == "QUEUE"
     assert "src_transactions" in dry_data["reason"]
 
-    # 3. Реальный запуск etl_transactions (пишет в src_transactions 18.11–19.11)
+    # 3. Реальный запуск etl_transactions (пишет в src_transactions 19.11–19.11)
     r2 = await client.post(
         "/api/runs",
         json={

@@ -138,18 +138,46 @@ class ProcessRegistry:
         target_date_clean: date = (
             target_date.date() if isinstance(target_date, datetime) else target_date
         )
-        # target_date - window_days matches SDD section 1.3, section 5.2 and TC-04
-        date_from = target_date_clean - timedelta(days=window_days)
+        # target_date - (window_days - 1): ровно window_days дней включительно
+        window_date_from = target_date_clean - timedelta(days=max(window_days - 1, 0))
         date_to = target_date_clean
 
         resources = proc_cfg.get("resources", [])
         locks: List[ResourceLockSpec] = []
         for r in resources:
+            res_id = r["resource_id"]
+            mode = r["mode"].upper()
+            # Для выходных витрин (mart_* в WRITE) точечный интервал даты target_date,
+            # чтобы запуски за соседние даты не конфликтовали между собой по ключу (process_id, target_date)
+            if res_id.startswith("mart_") and mode == "WRITE":
+                r_date_from = target_date_clean
+                r_date_to = target_date_clean
+            else:
+                r_date_from = window_date_from
+                r_date_to = date_to
+
             lock = ResourceLockSpec(
-                resource_id=r["resource_id"],
-                date_from=date_from,
-                date_to=date_to,
-                access_mode=r["mode"].upper(),
+                resource_id=res_id,
+                date_from=r_date_from,
+                date_to=r_date_to,
+                access_mode=mode,
             )
             locks.append(lock)
         return locks
+
+    def get_date_range(
+        self, process_id: str, target_date: date | datetime
+    ) -> tuple[date, date]:
+        """Возвращает скользящее окно (date_from, date_to) для процесса."""
+        self._load_config()
+        if self._config is None:
+            raise RuntimeError("Registry configuration could not be loaded")
+        proc_cfg = self._config.get("processes", {}).get(process_id)
+        if not proc_cfg:
+            raise KeyError(f"Unknown process_id: {process_id}")
+        window_days: int = int(proc_cfg.get("window_days", 0))
+        target_date_clean: date = (
+            target_date.date() if isinstance(target_date, datetime) else target_date
+        )
+        date_from = target_date_clean - timedelta(days=max(window_days - 1, 0))
+        return date_from, target_date_clean
