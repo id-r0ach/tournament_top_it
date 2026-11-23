@@ -670,8 +670,8 @@ class Orchestrator:
                 await conn.execute(
                     """
                     UPDATE runs
-                    SET status = $1,
-                        progress = CASE WHEN $1 = 'COMPLETED' THEN 100 ELSE progress END,
+                    SET status = $1::text,
+                        progress = CASE WHEN $1::text = 'COMPLETED' THEN 100 ELSE progress END,
                         blocked_reason = $2,
                         finished_at = NOW()
                     WHERE run_id = $3
