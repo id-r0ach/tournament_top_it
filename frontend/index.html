@@ -2,63 +2,261 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>Risk Process Orchestrator MVP</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RiskFlow Orchestrator — Управление процессами оценки рисков</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Oswald:wght@600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-    <div id="header">
-        <h1>Risk Process Orchestrator MVP</h1>
-        <span id="ws-status">Переподключение...</span>
-        <div id="timer-config">
-            <label>Интервал таймера (сек): <input type="number" id="timer-interval" min="1" value="15"></label>
-            <button id="save-interval">Сохранить</button>
-        </div>
-    </div>
-    <div id="main" class="grid">
-        <div id="left-pane">
-            <h2>Панель запуска и предпроверки (FR-15)</h2>
-            <div class="section">
-                <label>Аналитик:
-                    <select id="analyst-select">
-                        <option value="Аналитик 1">Аналитик 1</option>
-                        <option value="Аналитик 2">Аналитик 2</option>
-                        <option value="Риск-менеджер">Риск-менеджер</option>
-                    </select>
-                </label>
-                <br><br>
-                <label>Процесс:
-                    <select id="process-select">
-                        <option value="">Загрузка...</option>
-                    </select>
-                </label>
-                <br><br>
-                <label>Target Date: <input type="date" id="target-date"></label>
+    <header class="topbar">
+        <div class="topbar-left">
+            <div class="brand-logo" title="Разработано командой Codelink">
+                <svg width="26" height="26" viewBox="0 0 24 24" shape-rendering="crispEdges">
+                    <!-- C -->
+                    <path fill="#ffffff" d="M3 2h5v2H3zM1 4h2v6H1zM3 10h5v2H3z"/>
+                    <!-- O with X -->
+                    <path fill="#ffffff" d="M15 1h4v1h2v2h1v4h-1v2h-2v1h-4v-1h-2V8h-1V4h1V2h2V1zm0 3v1h1v1h-1v1h-1v1h2V7h1v1h2V7h-1V6h-1V5h1V4h-2v1h-1V4h-2z"/>
+                    <!-- D -->
+                    <path fill="#ffffff" d="M1 14h5v2H3v4h3v2H1v-8zm5 2h2v4H6v-4z"/>
+                    <!-- E -->
+                    <path fill="#ffffff" d="M13 14h7v2h-5v1h4v2h-4v1h5v2h-7v-8z"/>
+                </svg>
             </div>
-            <div class="section dry-run" id="dry-run">Проверка конфликтов...</div>
-            <button id="run-calculation">Запустить расчёт</button>
-            <div class="section demo-scenarios" style="margin-top: 15px;">
-                <h3>Демо-сценарии</h3>
-                <button id="run-cron">Запустить регламент (Cron / MACHINE)</button>
-                <button id="test-deduplication">Тест дедупликации (2 аналитика подряд)</button>
-                <button id="hidden-conflict">Скрытый конфликт окна (20 и 19 число)</button>
+            <div>
+                <div class="brand-title-row">
+                    <h1 class="brand-title">RiskFlow Orchestrator</h1>
+                    <span class="codelink-pill">by Codelink</span>
+                </div>
+                <span class="brand-sub">Система бесконфликтного управления процессами оценки рисков</span>
             </div>
         </div>
-        <div id="right-pane">
-            <h2>Live-мониторинг (FR-14, FR-16)</h2>
-            <h3>Таймер регламентных задач (WAITING_TIMER)</h3>
-            <div class="section timer-widget" id="waiting-timer"></div>
-            <h3>Активные расчёты (RUNNING)</h3>
-            <div id="running-cards"></div>
-            <h3>Очередь ожидания (QUEUED)</h3>
-            <div id="queued-list"></div>
-            <h3>Активные блокировки (active_locks)</h3>
-            <div id="active-locks"></div>
-            <h3>История запусков (history)</h3>
-            <div id="history"></div>
-            <h3>Журнал аудита (audit_logs)</h3>
-            <div id="audit-logs"></div>
+
+        <div class="topbar-right">
+            <div class="timer-setting" title="Интервал опроса очереди пользователей для регламентных задач машины (Timer Intermediate, Catching)">
+                <span class="setting-label">Таймер машины (сек):</span>
+                <input type="number" id="timer-interval" min="1" max="120" value="15">
+                <button id="save-interval" class="btn btn-secondary btn-sm">Применить</button>
+            </div>
+            <button id="theme-toggle" class="btn btn-secondary btn-sm" title="Переключить тёмную/светлую тему">☀️ Светлая тема</button>
+            <div class="ws-pill" id="ws-pill">
+                <span class="ws-dot" id="ws-dot"></span>
+                <span id="ws-status">Подключение...</span>
+            </div>
         </div>
-    </div>
+    </header>
+
+    <!-- Верхняя KPI-лента -->
+    <section class="kpi-strip">
+        <div class="kpi-card">
+            <div class="kpi-label">Выполняется сейчас</div>
+            <div class="kpi-value text-green" id="kpi-running">0</div>
+            <div class="kpi-hint">Изолированные воркеры</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">В очереди (Lock-менеджер)</div>
+            <div class="kpi-value text-amber" id="kpi-queued">0</div>
+            <div class="kpi-hint">Без блокировки таблиц БД</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Ожидание машины (Таймер)</div>
+            <div class="kpi-value text-purple" id="kpi-timer">0</div>
+            <div class="kpi-hint">Приоритет пользователей</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Активных блокировок</div>
+            <div class="kpi-value text-blue" id="kpi-locks">0</div>
+            <div class="kpi-hint">Композитные ключи с TTL</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Завершено / Дедупл.</div>
+            <div class="kpi-value text-green" id="kpi-completed">0</div>
+            <div class="kpi-hint">0% Deadlocks в СУБД</div>
+        </div>
+    </section>
+
+    <main class="workspace">
+        <!-- ЛЕВАЯ КОЛОНКА: ПАНЕЛЬ ЗАПУСКА, ПРЕДПРОВЕРКА И ДЕМО-СЦЕНАРИИ -->
+        <aside class="left-column">
+            <div class="panel">
+                <div class="panel-header">
+                    <h2>Запуск оценки риска</h2>
+                    <span class="badge badge-user">Приоритет USER</span>
+                </div>
+
+                <div class="form-group">
+                    <label for="analyst-select">Инициатор (Аналитик)</label>
+                    <select id="analyst-select" class="form-control">
+                        <option value="Аналитик 1">Аналитик 1 (Кредитные риски)</option>
+                        <option value="Аналитик 2">Аналитик 2 (Контрагенты)</option>
+                        <option value="Риск-менеджер">Риск-менеджер (Сводный отчёт)</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label for="process-select">Бизнес-процесс оценки</label>
+                    <select id="process-select" class="form-control">
+                        <option value="">Загрузка справочника...</option>
+                    </select>
+                    <div class="process-meta" id="process-meta"></div>
+                </div>
+
+                <div class="form-group">
+                    <label for="target-date">Целевая дата расчёта</label>
+                    <input type="date" id="target-date" class="form-control">
+                </div>
+
+                <!-- Карточка живой предпроверки (Dry-Run FR-15) -->
+                <div class="dry-run-box" id="dry-run">
+                    <div class="dry-run-header">
+                        <span class="dry-run-badge" id="dry-run-badge">Проверка...</span>
+                        <span class="dry-run-window" id="dry-run-window"></span>
+                    </div>
+                    <div class="dry-run-reason" id="dry-run-reason">Анализ совместимости ресурсов...</div>
+                    <div class="dry-run-locks" id="dry-run-locks"></div>
+                </div>
+
+                <button id="run-calculation" class="btn btn-primary btn-block">
+                    ▶ Запустить расчёт риска
+                </button>
+            </div>
+
+            <!-- Панель демонстрационных сценариев для жюри -->
+            <div class="panel demo-panel">
+                <div class="panel-header">
+                    <h2>Демо-сценарии для проверки</h2>
+                    <span class="badge badge-info">1 клик</span>
+                </div>
+                <p class="panel-desc">Автоматическая симуляция ключевых конфликтов из кейса:</p>
+
+                <button id="demo-parallel-dates" class="btn btn-demo">
+                    <div class="demo-btn-title">1. Один процесс за разные даты (19 и 20 ноя)</div>
+                    <div class="demo-btn-sub">Параллельный старт с точечным окном витрины mart_credit_risk</div>
+                </button>
+
+                <button id="test-deduplication" class="btn btn-demo">
+                    <div class="demo-btn-title">2. Дублирующий запуск (2 аналитика подряд)</div>
+                    <div class="demo-btn-sub">Подключение второго как подписчика без нагрузки</div>
+                </button>
+
+                <button id="hidden-conflict" class="btn btn-demo">
+                    <div class="demo-btn-title">3. Скрытый конфликт окна (20.11 + 19.11 ETL)</div>
+                    <div class="demo-btn-sub">Пересечение скользящего окна 7 дн. → Очередь</div>
+                </button>
+
+                <button id="run-cron" class="btn btn-demo btn-demo-accent">
+                    <div class="demo-btn-title">4. Регламентный запуск машины (Cron)</div>
+                    <div class="demo-btn-sub">Переход в Timer Catching при активных пользователях</div>
+                </button>
+            </div>
+        </aside>
+
+        <!-- ПРАВАЯ КОЛОНКА: LIVE-МОНИТОРИНГ, ТАЙМЛАЙН И БЛОКИРОВКИ -->
+        <section class="right-column">
+            <!-- Визуальная шкала последовательности выполнения (Таймлайн / Гант) -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div>
+                        <h2>Последовательность выполнения задач (Live-Таймлайн / Гант)</h2>
+                        <div class="panel-caption">Наглядная шкала: параллельные расчёты, очередь Lock-менеджера и ожидание машины</div>
+                    </div>
+                    <div class="gantt-legend">
+                        <span><i class="dot-green"></i>Выполняется</span>
+                        <span><i class="dot-done"></i>Завершено</span>
+                        <span><i class="dot-amber"></i>Очередь Lock</span>
+                        <span><i class="dot-purple"></i>Таймер машины</span>
+                    </div>
+                </div>
+                <div id="timeline-container" class="timeline-container">
+                    <div class="empty-state">Запустите расчёты или выберите демо-сценарий слева, чтобы увидеть диаграмму выполнения</div>
+                </div>
+            </div>
+
+            <!-- Блок регламентных задач на таймере -->
+            <div class="panel" id="timer-panel">
+                <div class="panel-header">
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <span class="timer-dot"></span>
+                        <h2>Таймер ожидания машины (Timer Intermediate, Catching)</h2>
+                    </div>
+                    <span class="badge badge-purple" id="timer-count-badge">0 задач</span>
+                </div>
+                <div id="waiting-timer" class="cards-list">
+                    <div class="empty-state">Нет отложенных регламентных задач — машина свободна.</div>
+                </div>
+            </div>
+
+            <!-- Активные расчёты + Очередь в 2 колонки -->
+            <div class="two-col-grid">
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2>Активные расчёты (В работе)</h2>
+                        <span class="badge badge-green" id="running-count-badge">0</span>
+                    </div>
+                    <div id="running-cards" class="cards-list">
+                        <div class="empty-state">Нет активных расчётов.</div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2>Очередь ожидания (Lock-менеджер)</h2>
+                        <span class="badge badge-amber" id="queued-count-badge">0</span>
+                    </div>
+                    <div id="queued-list" class="cards-list">
+                        <div class="empty-state">Очередь пуста — конфликтов нет.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Таблица активных композитных блокировок -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h2>Карта активных блокировок ресурсов (Composite Lock Manager)</h2>
+                    <span class="panel-caption mono">Ключ: (Ресурс + Диапазон дат + Режим)</span>
+                </div>
+                <div id="active-locks">
+                    <div class="empty-state">Активных блокировок нет.</div>
+                </div>
+            </div>
+
+            <!-- Вкладки: История запусков и Журнал аудита -->
+            <div class="panel">
+                <div class="tabs-bar">
+                    <button class="tab-btn active" data-tab="tab-history">История запусков (<span id="hist-count">0</span>)</button>
+                    <button class="tab-btn" data-tab="tab-audit">Журнал аудита оркестратора (<span id="audit-count">0</span>)</button>
+                </div>
+
+                <div id="tab-history" class="tab-content active">
+                    <div id="history">
+                        <div class="empty-state">Завершённых расчётов пока нет.</div>
+                    </div>
+                </div>
+
+                <div id="tab-audit" class="tab-content">
+                    <div id="audit-logs" class="audit-feed">
+                        <div class="empty-state">Записей аудита пока нет.</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="app-footer">
+        <div class="footer-brand">
+            <div class="footer-logo">
+                <svg width="18" height="18" viewBox="0 0 24 24" shape-rendering="crispEdges">
+                    <path fill="#ffffff" d="M3 2h5v2H3zM1 4h2v6H1zM3 10h5v2H3z"/>
+                    <path fill="#ffffff" d="M15 1h4v1h2v2h1v4h-1v2h-2v1h-4v-1h-2V8h-1V4h1V2h2V1zm0 3v1h1v1h-1v1h-1v1h2V7h1v1h2V7h-1V6h-1V5h1V4h-2v1h-1V4h-2z"/>
+                    <path fill="#ffffff" d="M1 14h5v2H3v4h3v2H1v-8zm5 2h2v4H6v-4z"/>
+                    <path fill="#ffffff" d="M13 14h7v2h-5v1h4v2h-4v1h5v2h-7v-8z"/>
+                </svg>
+            </div>
+            <span>Разработано командой <strong>Codelink</strong> &bull; RiskFlow Orchestrator MVP</span>
+        </div>
+    </footer>
+
     <script src="/static/app.js"></script>
 </body>
 </html>
