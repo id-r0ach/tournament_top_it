@@ -1,7 +1,11 @@
 # Risk Process Orchestrator MVP
 
+<p align="left">
+  <img src="frontend/logo.png" width="72" height="72" alt="CodeLink Logo" style="border-radius: 10px;" />
+</p>
+
 > **MVP-модуль оркестрации параллельных процессов оценки рисков**  
-> Разработано в рамках турнира «ТОП ИТ» (Заочный этап).
+> Разработано командой **CodeLink** в рамках турнира «ТОП ИТ» (Заочный этап).
 
 ---
 

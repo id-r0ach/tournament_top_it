@@ -52,6 +52,7 @@ if frontend_dir.is_dir():
     app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
 
 index_file = frontend_dir / "index.html"
+favicon_file = frontend_dir / "favicon.ico"
 
 
 @app.get("/")
@@ -65,3 +66,10 @@ async def read_index():
             "docs": "/docs",
         }
     )
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def read_favicon():
+    if favicon_file.exists():
+        return FileResponse(str(favicon_file))
+    return JSONResponse(status_code=404, content={"detail": "Not found"})
