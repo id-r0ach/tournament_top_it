@@ -26,12 +26,14 @@ window.addEventListener("load", async () => {
     let processesMap = {};
     let ws = null;
     let reconnectTimer = null;
+    let nextTimerCheckAt = null;
 
     // Theme persistence & toggle
     const applyTheme = (isLight) => {
         document.body.classList.toggle("light-theme", isLight);
         if (themeToggleBtn) {
-            themeToggleBtn.textContent = isLight ? "🌙 Тёмная тема" : "☀️ Светлая тема";
+            themeToggleBtn.textContent = isLight ? "🌙" : "☀️";
+            themeToggleBtn.title = "Переключить тему";
         }
         try {
             localStorage.setItem("riskflow_theme", isLight ? "light" : "dark");
@@ -49,6 +51,35 @@ window.addEventListener("load", async () => {
             applyTheme(!document.body.classList.contains("light-theme"));
         });
     }
+
+    // Dynamic timer countdown
+    const updateCountdown = () => {
+        const el = document.getElementById("timer-countdown");
+        if (!el) return;
+        if (!nextTimerCheckAt) {
+            el.textContent = "Через -- с";
+            return;
+        }
+        const diffMs = new Date(nextTimerCheckAt).getTime() - Date.now();
+        const diffSec = Math.max(0, Math.ceil(diffMs / 1000));
+        el.textContent = `Через ${diffSec} с`;
+    };
+    setInterval(updateCountdown, 500);
+
+    // Anti-spam button lock helper
+    const withBtnLock = async (btn, asyncFn) => {
+        if (!btn || btn.disabled) return;
+        btn.disabled = true;
+        try {
+            await asyncFn();
+        } catch (e) {
+            console.error("Action error:", e);
+        } finally {
+            setTimeout(() => {
+                btn.disabled = false;
+            }, 350);
+        }
+    };
 
     // Tabs switching
     document.querySelectorAll(".tab-btn").forEach((btn) => {
@@ -168,7 +199,8 @@ window.addEventListener("load", async () => {
             processesMap[pId] = p;
             const opt = document.createElement("option");
             opt.value = pId;
-            opt.textContent = `${p.name || pId} (окно ${p.window_days || 1} дн.)`;
+            const cleanName = (p.name || pId).replace(/\s*\(.*\)/g, "").trim();
+            opt.textContent = `${cleanName} · ${p.window_days || 1} дн.`;
             processSelect.appendChild(opt);
         });
         renderProcessMeta();
@@ -176,15 +208,31 @@ window.addEventListener("load", async () => {
 
     const setDefaultDate = () => {
         if (!dateInput) return;
-        dateInput.value = new Date().toISOString().split("T")[0];
+        dateInput.value = "2026-11-20";
     };
 
-    const payloadFromForm = () => ({
-        process_id: processSelect ? processSelect.value : "credit_risk",
-        target_date: dateInput ? dateInput.value : new Date().toISOString().split("T")[0],
-        user_name: analystSelect ? analystSelect.value : "Аналитик 1",
-        initiator: "USER",
-    });
+    const updateInitiatorBadge = () => {
+        const badge = document.getElementById("initiator-badge");
+        if (!badge || !analystSelect) return;
+        const isMachine = analystSelect.value === "MACHINE";
+        if (isMachine) {
+            badge.textContent = "Приоритет MACHINE";
+            badge.className = "badge badge-machine";
+        } else {
+            badge.textContent = "Приоритет USER";
+            badge.className = "badge badge-user";
+        }
+    };
+
+    const payloadFromForm = () => {
+        const isMachine = analystSelect && analystSelect.value === "MACHINE";
+        return {
+            process_id: processSelect ? processSelect.value : "credit_risk",
+            target_date: dateInput ? dateInput.value : "2026-11-20",
+            user_name: isMachine ? "Планировщик (Cron)" : (analystSelect ? analystSelect.value : "Аналитик 1"),
+            initiator: isMachine ? "MACHINE" : "USER",
+        };
+    };
 
     const refreshDryRun = async () => {
         if (!processSelect || !dateInput || !processSelect.value || !dateInput.value) return;
@@ -263,111 +311,132 @@ window.addEventListener("load", async () => {
         }
     };
 
-    // Actions
+    // Actions with spam protection
     if (runBtn) {
-        runBtn.addEventListener("click", async () => {
-            await fetch("/api/runs", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payloadFromForm()),
+        runBtn.addEventListener("click", () => {
+            withBtnLock(runBtn, async () => {
+                await fetch("/api/runs", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payloadFromForm()),
+                });
             });
         });
     }
 
     if (parallelDatesBtn) {
-        parallelDatesBtn.addEventListener("click", async () => {
-            const user = analystSelect ? analystSelect.value : "Аналитик 1";
-            await Promise.all([
-                fetch("/api/runs", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        process_id: "credit_risk",
-                        target_date: "2026-11-19",
-                        user_name: user,
-                        initiator: "USER",
+        parallelDatesBtn.addEventListener("click", () => {
+            withBtnLock(parallelDatesBtn, async () => {
+                const user = analystSelect ? analystSelect.value : "Аналитик 1";
+                await Promise.all([
+                    fetch("/api/runs", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            process_id: "credit_risk",
+                            target_date: "2026-11-19",
+                            user_name: user,
+                            initiator: "USER",
+                        }),
                     }),
-                }),
-                fetch("/api/runs", {
+                    fetch("/api/runs", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            process_id: "credit_risk",
+                            target_date: "2026-11-20",
+                            user_name: "Аналитик 2",
+                            initiator: "USER",
+                        }),
+                    }),
+                ]);
+            });
+        });
+    }
+
+    if (dedupBtn) {
+        dedupBtn.addEventListener("click", () => {
+            withBtnLock(dedupBtn, async () => {
+                const base = payloadFromForm();
+                await Promise.all([
+                    fetch("/api/runs", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ ...base, user_name: "Аналитик 1" }),
+                    }),
+                    fetch("/api/runs", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ ...base, user_name: "Аналитик 2" }),
+                    }),
+                ]);
+            });
+        });
+    }
+
+    if (hiddenBtn) {
+        hiddenBtn.addEventListener("click", () => {
+            withBtnLock(hiddenBtn, async () => {
+                const user = analystSelect ? analystSelect.value : "Аналитик 1";
+                await fetch("/api/runs", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                         process_id: "credit_risk",
                         target_date: "2026-11-20",
-                        user_name: "Аналитик 2",
-                        initiator: "USER",
-                    }),
-                }),
-            ]);
-        });
-    }
-
-    if (dedupBtn) {
-        dedupBtn.addEventListener("click", async () => {
-            const base = payloadFromForm();
-            await Promise.all([
-                fetch("/api/runs", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ ...base, user_name: "Аналитик 1" }),
-                }),
-                fetch("/api/runs", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ ...base, user_name: "Аналитик 2" }),
-                }),
-            ]);
-        });
-    }
-
-    if (hiddenBtn) {
-        hiddenBtn.addEventListener("click", async () => {
-            const user = analystSelect ? analystSelect.value : "Аналитик 1";
-            await fetch("/api/runs", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    process_id: "credit_risk",
-                    target_date: "2026-11-20",
-                    user_name: user,
-                    initiator: "USER",
-                }),
-            });
-            setTimeout(async () => {
-                await fetch("/api/runs", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        process_id: "etl_transactions",
-                        target_date: "2026-11-19",
-                        user_name: "Аналитик 2",
+                        user_name: user,
                         initiator: "USER",
                     }),
                 });
-            }, 250);
+                setTimeout(async () => {
+                    await fetch("/api/runs", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            process_id: "etl_transactions",
+                            target_date: "2026-11-19",
+                            user_name: "Аналитик 2",
+                            initiator: "USER",
+                        }),
+                    });
+                }, 250);
+            });
         });
     }
 
     if (cronBtn) {
-        cronBtn.addEventListener("click", async () => {
-            const procId = processSelect ? processSelect.value : "credit_risk";
-            const tDate = dateInput ? dateInput.value : new Date().toISOString().split("T")[0];
-            const params = new URLSearchParams({
-                process_id: procId,
-                target_date: tDate,
+        cronBtn.addEventListener("click", () => {
+            withBtnLock(cronBtn, async () => {
+                const procId = processSelect ? processSelect.value : "credit_risk";
+                const tDate = dateInput ? dateInput.value : "2026-11-20";
+                const params = new URLSearchParams({
+                    process_id: procId,
+                    target_date: tDate,
+                });
+                await fetch(`/api/demo/trigger-cron?${params.toString()}`, { method: "POST" });
             });
-            await fetch(`/api/demo/trigger-cron?${params.toString()}`, { method: "POST" });
         });
     }
 
     if (saveIntervalBtn && timerIntervalInput) {
-        saveIntervalBtn.addEventListener("click", async () => {
-            const val = parseInt(timerIntervalInput.value, 10);
-            if (Number.isNaN(val) || val < 1) return;
-            await fetch("/api/config", {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ machine_timer_interval_sec: val }),
+        saveIntervalBtn.addEventListener("click", () => {
+            withBtnLock(saveIntervalBtn, async () => {
+                const val = parseInt(timerIntervalInput.value, 10);
+                if (Number.isNaN(val) || val < 1) return;
+                await fetch("/api/config", {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ machine_timer_interval_sec: val }),
+                });
+            });
+        });
+    }
+
+    const resetBtn = document.getElementById("reset-history-btn");
+    if (resetBtn) {
+        resetBtn.addEventListener("click", () => {
+            withBtnLock(resetBtn, async () => {
+                await fetch("/api/demo/reset", { method: "POST" });
             });
         });
     }
@@ -449,6 +518,11 @@ window.addEventListener("load", async () => {
 
     const renderState = (snap) => {
         if (!snap) return;
+
+        if (snap.config && snap.config.next_timer_check_at) {
+            nextTimerCheckAt = snap.config.next_timer_check_at;
+            updateCountdown();
+        }
 
         if (
             snap.config &&
@@ -568,7 +642,7 @@ window.addEventListener("load", async () => {
                         </div>
                         <div class="task-footer">
                             <span class="subscribers-list">Подписчики: ${subs || run.user_name || "—"}</span>
-                            <button class="btn btn-danger" title="Проверка Watchdog TTL (NFR-02)">Имитировать сбой (TTL)</button>
+                            <button class="btn btn-danger" title="Chaos-тест Watchdog TTL (NFR-02): остановка heartbeat воркера для проверки автоснятия блокировок">Имитировать сбой (TTL)</button>
                         </div>
                     `;
                     const crashBtn = card.querySelector("button");
@@ -741,6 +815,7 @@ window.addEventListener("load", async () => {
 
     // Initial load
     setDefaultDate();
+    updateInitiatorBadge();
     try {
         await loadProcesses();
     } catch (err) {
@@ -763,7 +838,12 @@ window.addEventListener("load", async () => {
             refreshDryRun();
         });
     }
-    if (analystSelect) analystSelect.addEventListener("change", refreshDryRun);
+    if (analystSelect) {
+        analystSelect.addEventListener("change", () => {
+            updateInitiatorBadge();
+            refreshDryRun();
+        });
+    }
 
     await refreshDryRun();
     connectWs();

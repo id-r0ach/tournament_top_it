@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -61,6 +62,13 @@ class Orchestrator:
         self._heartbeat_interval_sec: int = int(
             self._config.get("heartbeat_interval_sec", 3)
         )
+        self._max_machine_wait_sec: int = int(
+            os.getenv("MAX_MACHINE_WAIT_SEC", "90")
+        )
+        self._timer_interval_started_at: float = time.monotonic()
+        self._next_timer_check_at: str = (
+            datetime.now(timezone.utc) + timedelta(seconds=self._machine_timer_interval_sec)
+        ).isoformat()
         self._bg_tasks: list[asyncio.Task[Any]] = []
         self._worker_tasks: set[asyncio.Task[Any]] = set()
         self._persist_tasks: set[asyncio.Task[Any]] = set()
@@ -380,17 +388,84 @@ class Orchestrator:
                 if request.user_name not in subscribers:
                     subscribers.append(request.user_name)
 
-                audit_item = (
-                    existing_id,
-                    "DEDUPLICATED",
-                    f"Заявка от {request.user_name} ({request.initiator}) присоединена к запуску #{str(existing_id)[:8]}",
-                    {
-                        "subscriber": request.user_name,
-                        "initiator": request.initiator,
-                        "process_id": request.process_id,
-                        "target_date": str(request.target_date),
-                    },
+                # Дедупликация USER поверх спящей задачи MACHINE (WAITING_TIMER)
+                should_promote = (
+                    request.initiator == "USER"
+                    and dup_run.get("initiator") == "MACHINE"
+                    and dup_run.get("status") == "WAITING_TIMER"
                 )
+
+                if should_promote:
+                    dup_run["initiator"] = "USER"
+                    dup_run["user_name"] = request.user_name
+
+                    conflicts = []
+                    for req in lock_specs:
+                        req_f = lock_manager._to_date(req.date_from)
+                        req_t = lock_manager._to_date(req.date_to)
+                        req_m = req.access_mode.upper()
+                        for act in self._mem_locks:
+                            if req.resource_id != act["resource_id"]:
+                                continue
+                            if not lock_manager._intersects(req_f, req_t, act["date_from"], act["date_to"]):
+                                continue
+                            if req_m == "READ" and act["access_mode"] == "READ":
+                                continue
+                            conflicts.append(act)
+
+                    if conflicts:
+                        dup_run["status"] = "QUEUED"
+                        owner_short = str(conflicts[0]["run_id"])[:8]
+                        dup_run["blocked_reason"] = (
+                            f"Ожидание освобождения: {conflicts[0]['resource_id']} (владелец #{owner_short})"
+                        )
+                    else:
+                        dup_run["status"] = "RUNNING"
+                        dup_run["blocked_reason"] = None
+                        dup_run["started_at"] = datetime.now(timezone.utc)
+                        lock_token = uuid.uuid4()
+                        dup_run["lock_token"] = lock_token
+                        expires = datetime.now(timezone.utc) + timedelta(seconds=self._lock_ttl_sec)
+                        for req in lock_specs:
+                            self._mem_locks.append(
+                                {
+                                    "run_id": existing_id,
+                                    "resource_id": req.resource_id,
+                                    "date_from": lock_manager._to_date(req.date_from),
+                                    "date_to": lock_manager._to_date(req.date_to),
+                                    "access_mode": req.access_mode.upper(),
+                                    "expires_at": expires,
+                                }
+                            )
+                        run_to_start = existing_id
+
+                    audit_item = (
+                        existing_id,
+                        "USER_PROMOTION",
+                        (
+                            f"Задача #{str(existing_id)[:8]} повышена с MACHINE до USER "
+                            f"по запросу {request.user_name} и переведена в {dup_run['status']}"
+                        ),
+                        {
+                            "subscriber": request.user_name,
+                            "initiator": "USER",
+                            "process_id": request.process_id,
+                            "target_date": str(request.target_date),
+                            "new_status": dup_run["status"],
+                        },
+                    )
+                else:
+                    audit_item = (
+                        existing_id,
+                        "DEDUPLICATED",
+                        f"Заявка от {request.user_name} ({request.initiator}) присоединена к запуску #{str(existing_id)[:8]}",
+                        {
+                            "subscriber": request.user_name,
+                            "initiator": request.initiator,
+                            "process_id": request.process_id,
+                            "target_date": str(request.target_date),
+                        },
+                    )
                 run_dict_for_response = dict(dup_run)
             else:
                 run_id = uuid.uuid4()
@@ -556,11 +631,50 @@ class Orchestrator:
             async with pool.acquire() as conn:
                 async with conn.transaction():
                     if is_attached:
-                        await conn.execute(
-                            "UPDATE runs SET subscribers = $1::jsonb WHERE run_id = $2",
-                            json.dumps(run_data["subscribers"], ensure_ascii=False),
-                            run_data["run_id"],
-                        )
+                        # Если фоновая задача первичного создания ещё фиксируется в БД, ожидаем появления строки
+                        row_exists = await conn.fetchval("SELECT 1 FROM runs WHERE run_id = $1", run_data["run_id"])
+                        if not row_exists:
+                            for _ in range(10):
+                                await asyncio.sleep(0.05)
+                                row_exists = await conn.fetchval("SELECT 1 FROM runs WHERE run_id = $1", run_data["run_id"])
+                                if row_exists:
+                                    break
+
+                        if audit_item and audit_item[1] == "USER_PROMOTION":
+                            await conn.execute(
+                                """
+                                UPDATE runs
+                                SET initiator = $1,
+                                    user_name = $2,
+                                    status = $3,
+                                    subscribers = $4::jsonb,
+                                    blocked_reason = $5,
+                                    started_at = $6,
+                                    lock_token = $7
+                                WHERE run_id = $8
+                                """,
+                                run_data["initiator"],
+                                run_data["user_name"],
+                                run_data["status"],
+                                json.dumps(run_data["subscribers"], ensure_ascii=False),
+                                run_data.get("blocked_reason"),
+                                run_data.get("started_at"),
+                                run_data.get("lock_token"),
+                                run_data["run_id"],
+                            )
+                            if run_data.get("status") == "RUNNING" and lock_specs:
+                                await lock_manager.acquire_locks(
+                                    conn=conn,
+                                    run_id=run_data["run_id"],
+                                    required_locks=lock_specs,
+                                    ttl_sec=self._lock_ttl_sec,
+                                )
+                        else:
+                            await conn.execute(
+                                "UPDATE runs SET subscribers = $1::jsonb WHERE run_id = $2",
+                                json.dumps(run_data["subscribers"], ensure_ascii=False),
+                                run_data["run_id"],
+                            )
                     else:
                         await conn.execute(
                             """
@@ -697,42 +811,13 @@ class Orchestrator:
         await self._broadcast_state_safe()
 
     async def process_queue(self) -> None:
-        """Переводит задачи из таймера при отсутствии USER-задач и запускает свободные из QUEUED."""
+        """Запускает свободные задачи из общей очереди QUEUED с учётом конфликтов блокировок."""
         runs_to_launch: list[UUID] = []
         state_changed = False
 
         async with self._lock:
             pool = await database.get_pool()
             async with pool.acquire() as conn:
-                user_active_count = await conn.fetchval(
-                    """
-                    SELECT COUNT(*)
-                    FROM runs
-                    WHERE initiator = 'USER'
-                      AND status IN ('RUNNING', 'QUEUED')
-                    """
-                )
-
-                if not user_active_count or user_active_count == 0:
-                    promoted = await conn.fetch(
-                        """
-                        UPDATE runs
-                        SET status = 'QUEUED',
-                            blocked_reason = 'Переведено из таймера в общую очередь'
-                        WHERE status = 'WAITING_TIMER'
-                        RETURNING run_id
-                        """
-                    )
-                    if promoted:
-                        state_changed = True
-                    for rec in promoted:
-                        await database.log_audit_event(
-                            run_id=rec["run_id"],
-                            event_type="QUEUED",
-                            message="Пользовательских задач нет: регламентный запуск переведён из WAITING_TIMER в QUEUED",
-                            conn=conn,
-                        )
-
                 queued_rows = await conn.fetch(
                     """
                     SELECT run_id, process_id, process_name, target_date, initiator, created_at
@@ -817,20 +902,102 @@ class Orchestrator:
         if state_changed:
             await self._broadcast_state_safe()
 
+    async def _check_machine_timer(self) -> None:
+        """Проверяет задачи WAITING_TIMER: защита от голодания и запуск при отсутствии задач пользователей."""
+        promoted_ids: list[UUID] = []
+        async with self._lock:
+            pool = await database.get_pool()
+            async with pool.acquire() as conn:
+                # 1. Защита от голодания (starvation): если задача висит > max_machine_wait_sec
+                starved_rows = await conn.fetch(
+                    """
+                    UPDATE runs
+                    SET status = 'QUEUED',
+                        blocked_reason = 'Защита от голодания: превышено максимальное время ожидания таймера'
+                    WHERE status = 'WAITING_TIMER'
+                      AND created_at <= NOW() - ($1 || ' seconds')::INTERVAL
+                    RETURNING run_id, process_name
+                    """,
+                    str(self._max_machine_wait_sec),
+                )
+                for rec in starved_rows:
+                    r_id = rec["run_id"]
+                    if r_id in self._mem_runs:
+                        self._mem_runs[r_id]["status"] = "QUEUED"
+                        self._mem_runs[r_id]["blocked_reason"] = (
+                            "Защита от голодания: превышено максимальное время ожидания таймера"
+                        )
+                    promoted_ids.append(r_id)
+                    await database.log_audit_event(
+                        run_id=r_id,
+                        event_type="STARVATION_PROMOTION",
+                        message=(
+                            f"Задача #{str(r_id)[:8]} ({rec['process_name']}) принудительно "
+                            f"переведена в QUEUED по защите от голодания (> {self._max_machine_wait_sec}с)"
+                        ),
+                        conn=conn,
+                    )
+
+                # 2. Плановый перевод при отсутствии активных задач пользователей
+                user_active_count = await conn.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM runs
+                    WHERE initiator = 'USER'
+                      AND status IN ('RUNNING', 'QUEUED')
+                    """
+                )
+                if not user_active_count or user_active_count == 0:
+                    regular_promoted = await conn.fetch(
+                        """
+                        UPDATE runs
+                        SET status = 'QUEUED',
+                            blocked_reason = 'Плановый тик таймера регламентных задач'
+                        WHERE status = 'WAITING_TIMER'
+                        RETURNING run_id, process_name
+                        """
+                    )
+                    for rec in regular_promoted:
+                        r_id = rec["run_id"]
+                        if r_id in self._mem_runs:
+                            self._mem_runs[r_id]["status"] = "QUEUED"
+                            self._mem_runs[r_id]["blocked_reason"] = (
+                                "Плановый тик таймера регламентных задач"
+                            )
+                        promoted_ids.append(r_id)
+                        await database.log_audit_event(
+                            run_id=r_id,
+                            event_type="QUEUED",
+                            message=(
+                                f"Тик таймера: регламентная задача #{str(r_id)[:8]} "
+                                f"({rec['process_name']}) переведена в общую очередь (QUEUED)"
+                            ),
+                            conn=conn,
+                        )
+
+        if promoted_ids:
+            await self.process_queue()
+            await self._broadcast_state_safe()
+
     async def _machine_timer_loop(self) -> None:
-        elapsed = 0
+        self._timer_interval_started_at = time.monotonic()
+        self._next_timer_check_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=self._machine_timer_interval_sec)
+        ).isoformat()
         while True:
-            await asyncio.sleep(1)
-            elapsed += 1
-            if elapsed < self._machine_timer_interval_sec:
-                continue
-            elapsed = 0
-            try:
-                await self.process_queue()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.exception("Ошибка в фоновом цикле таймера машины: %s", exc)
+            await asyncio.sleep(0.5)
+            now_mono = time.monotonic()
+            if now_mono - self._timer_interval_started_at >= self._machine_timer_interval_sec:
+                self._timer_interval_started_at = now_mono
+                self._next_timer_check_at = (
+                    datetime.now(timezone.utc) + timedelta(seconds=self._machine_timer_interval_sec)
+                ).isoformat()
+                try:
+                    await self._check_machine_timer()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.exception("Ошибка в фоновом цикле таймера машины: %s", exc)
 
     async def _watchdog_loop(self) -> None:
         while True:
@@ -887,6 +1054,10 @@ class Orchestrator:
         self._bg_tasks = [t for t in self._bg_tasks if not t.done()]
         if self._bg_tasks:
             return
+        self._timer_interval_started_at = time.monotonic()
+        self._next_timer_check_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=self._machine_timer_interval_sec)
+        ).isoformat()
         self._bg_tasks.append(asyncio.create_task(self._machine_timer_loop()))
         self._bg_tasks.append(asyncio.create_task(self._watchdog_loop()))
         logger.info(
@@ -981,12 +1152,18 @@ class Orchestrator:
                 "machine_timer_interval_sec": self._machine_timer_interval_sec,
                 "lock_ttl_sec": self._lock_ttl_sec,
                 "heartbeat_interval_sec": self._heartbeat_interval_sec,
+                "max_machine_wait_sec": self._max_machine_wait_sec,
+                "next_timer_check_at": self._next_timer_check_at,
             },
         )
 
-    async def update_config(self, cfg: ConfigUpdateRequest) -> dict[str, int]:
+    async def update_config(self, cfg: ConfigUpdateRequest) -> dict[str, Any]:
         if cfg.machine_timer_interval_sec is not None:
             self._machine_timer_interval_sec = int(cfg.machine_timer_interval_sec)
+            self._timer_interval_started_at = time.monotonic()
+            self._next_timer_check_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=self._machine_timer_interval_sec)
+            ).isoformat()
         if cfg.lock_ttl_sec is not None:
             self._lock_ttl_sec = int(cfg.lock_ttl_sec)
         if cfg.heartbeat_interval_sec is not None:
@@ -997,6 +1174,8 @@ class Orchestrator:
                 "machine_timer_interval_sec": self._machine_timer_interval_sec,
                 "lock_ttl_sec": self._lock_ttl_sec,
                 "heartbeat_interval_sec": self._heartbeat_interval_sec,
+                "max_machine_wait_sec": self._max_machine_wait_sec,
+                "next_timer_check_at": self._next_timer_check_at,
             }
         )
         await self._broadcast_state_safe()
@@ -1004,4 +1183,6 @@ class Orchestrator:
             "machine_timer_interval_sec": self._machine_timer_interval_sec,
             "lock_ttl_sec": self._lock_ttl_sec,
             "heartbeat_interval_sec": self._heartbeat_interval_sec,
+            "max_machine_wait_sec": self._max_machine_wait_sec,
+            "next_timer_check_at": self._next_timer_check_at,
         }

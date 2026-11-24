@@ -12,34 +12,31 @@
 <body>
     <header class="topbar">
         <div class="topbar-left">
-            <div class="brand-logo" title="Разработано командой Codelink">
-                <svg width="26" height="26" viewBox="0 0 24 24" shape-rendering="crispEdges">
-                    <!-- C -->
-                    <path fill="#ffffff" d="M3 2h5v2H3zM1 4h2v6H1zM3 10h5v2H3z"/>
-                    <!-- O with X -->
-                    <path fill="#ffffff" d="M15 1h4v1h2v2h1v4h-1v2h-2v1h-4v-1h-2V8h-1V4h1V2h2V1zm0 3v1h1v1h-1v1h-1v1h2V7h1v1h2V7h-1V6h-1V5h1V4h-2v1h-1V4h-2z"/>
-                    <!-- D -->
-                    <path fill="#ffffff" d="M1 14h5v2H3v4h3v2H1v-8zm5 2h2v4H6v-4z"/>
-                    <!-- E -->
-                    <path fill="#ffffff" d="M13 14h7v2h-5v1h4v2h-4v1h5v2h-7v-8z"/>
+            <div class="brand-logo" title="RiskFlow Orchestrator">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="5" cy="6" r="3" fill="#60a5fa" stroke="none"/>
+                    <circle cx="5" cy="18" r="3" fill="#34d399" stroke="none"/>
+                    <circle cx="19" cy="12" r="3" fill="#fbbf24" stroke="none"/>
+                    <path d="M7.8 7.2l8.4 3.6M7.8 16.8l8.4-3.6" stroke="#93c5fd" stroke-width="2"/>
                 </svg>
             </div>
             <div>
                 <div class="brand-title-row">
                     <h1 class="brand-title">RiskFlow Orchestrator</h1>
-                    <span class="codelink-pill">by Codelink</span>
                 </div>
                 <span class="brand-sub">Система бесконфликтного управления процессами оценки рисков</span>
             </div>
         </div>
 
         <div class="topbar-right">
-            <div class="timer-setting" title="Интервал опроса очереди пользователей для регламентных задач машины (Timer Intermediate, Catching)">
-                <span class="setting-label">Таймер машины (сек):</span>
+            <div class="timer-setting">
+                <span class="setting-label">Таймер машины:</span>
+                <span class="help-tooltip" title="Интервал проверки регламентных задач при отсутствии активных расчётов пользователей">?</span>
                 <input type="number" id="timer-interval" min="1" max="120" value="15">
-                <button id="save-interval" class="btn btn-secondary btn-sm">Применить</button>
+                <button id="save-interval" class="btn btn-secondary btn-sm" title="Применить интервал таймера">Ок</button>
+                <span id="timer-countdown" class="timer-countdown" title="Время до следующей проверки регламентных задач">Через -- с</span>
             </div>
-            <button id="theme-toggle" class="btn btn-secondary btn-sm" title="Переключить тёмную/светлую тему">☀️ Светлая тема</button>
+            <button id="theme-toggle" class="btn btn-secondary btn-icon" title="Переключить тему">☀️</button>
             <div class="ws-pill" id="ws-pill">
                 <span class="ws-dot" id="ws-dot"></span>
                 <span id="ws-status">Подключение...</span>
@@ -52,27 +49,22 @@
         <div class="kpi-card">
             <div class="kpi-label">Выполняется сейчас</div>
             <div class="kpi-value text-green" id="kpi-running">0</div>
-            <div class="kpi-hint">Изолированные воркеры</div>
         </div>
         <div class="kpi-card">
-            <div class="kpi-label">В очереди (Lock-менеджер)</div>
+            <div class="kpi-label">В очереди <span class="help-tooltip" title="Задачи, ожидающие освобождения ресурсов или завершения конфликтующих расчётов без блокировки таблиц СУБД">?</span></div>
             <div class="kpi-value text-amber" id="kpi-queued">0</div>
-            <div class="kpi-hint">Без блокировки таблиц БД</div>
         </div>
         <div class="kpi-card">
-            <div class="kpi-label">Ожидание машины (Таймер)</div>
+            <div class="kpi-label">Ожидание таймера <span class="help-tooltip" title="Регламентные задачи MACHINE, ожидающие тика таймера при отсутствии активных пользовательских расчётов (приоритет USER)">?</span></div>
             <div class="kpi-value text-purple" id="kpi-timer">0</div>
-            <div class="kpi-hint">Приоритет пользователей</div>
         </div>
         <div class="kpi-card">
-            <div class="kpi-label">Активных блокировок</div>
+            <div class="kpi-label">Активных блокировок <span class="help-tooltip" title="Композитные ключи (ресурс + диапазон дат + режим READ/WRITE) в распределённом менеджере блокировок с автоматическим TTL">?</span></div>
             <div class="kpi-value text-blue" id="kpi-locks">0</div>
-            <div class="kpi-hint">Композитные ключи с TTL</div>
         </div>
         <div class="kpi-card">
             <div class="kpi-label">Завершено / Дедупл.</div>
             <div class="kpi-value text-green" id="kpi-completed">0</div>
-            <div class="kpi-hint">0% Deadlocks в СУБД</div>
         </div>
     </section>
 
@@ -82,15 +74,16 @@
             <div class="panel">
                 <div class="panel-header">
                     <h2>Запуск оценки риска</h2>
-                    <span class="badge badge-user">Приоритет USER</span>
+                    <span id="initiator-badge" class="badge badge-user">Приоритет USER</span>
                 </div>
 
                 <div class="form-group">
-                    <label for="analyst-select">Инициатор (Аналитик)</label>
+                    <label for="analyst-select">Инициатор (Аналитик / Регламент)</label>
                     <select id="analyst-select" class="form-control">
                         <option value="Аналитик 1">Аналитик 1 (Кредитные риски)</option>
                         <option value="Аналитик 2">Аналитик 2 (Контрагенты)</option>
                         <option value="Риск-менеджер">Риск-менеджер (Сводный отчёт)</option>
+                        <option value="MACHINE">Планировщик (Cron / MACHINE)</option>
                     </select>
                 </div>
 
@@ -104,7 +97,7 @@
 
                 <div class="form-group">
                     <label for="target-date">Целевая дата расчёта</label>
-                    <input type="date" id="target-date" class="form-control">
+                    <input type="date" id="target-date" class="form-control" min="2026-01-01" max="2026-12-31">
                 </div>
 
                 <!-- Карточка живой предпроверки (Dry-Run FR-15) -->
@@ -226,6 +219,7 @@
                 <div class="tabs-bar">
                     <button class="tab-btn active" data-tab="tab-history">История запусков (<span id="hist-count">0</span>)</button>
                     <button class="tab-btn" data-tab="tab-audit">Журнал аудита оркестратора (<span id="audit-count">0</span>)</button>
+                    <button id="reset-history-btn" class="btn btn-secondary btn-sm" style="margin-left:auto;" title="Очистить историю завершённых задач и журнал аудита">Очистить историю</button>
                 </div>
 
                 <div id="tab-history" class="tab-content active">
@@ -246,11 +240,11 @@
     <footer class="app-footer">
         <div class="footer-brand">
             <div class="footer-logo">
-                <svg width="18" height="18" viewBox="0 0 24 24" shape-rendering="crispEdges">
-                    <path fill="#ffffff" d="M3 2h5v2H3zM1 4h2v6H1zM3 10h5v2H3z"/>
-                    <path fill="#ffffff" d="M15 1h4v1h2v2h1v4h-1v2h-2v1h-4v-1h-2V8h-1V4h1V2h2V1zm0 3v1h1v1h-1v1h-1v1h2V7h1v1h2V7h-1V6h-1V5h1V4h-2v1h-1V4h-2z"/>
-                    <path fill="#ffffff" d="M1 14h5v2H3v4h3v2H1v-8zm5 2h2v4H6v-4z"/>
-                    <path fill="#ffffff" d="M13 14h7v2h-5v1h4v2h-4v1h5v2h-7v-8z"/>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="5" cy="6" r="3" fill="#60a5fa" stroke="none"/>
+                    <circle cx="5" cy="18" r="3" fill="#34d399" stroke="none"/>
+                    <circle cx="19" cy="12" r="3" fill="#fbbf24" stroke="none"/>
+                    <path d="M7.8 7.2l8.4 3.6M7.8 16.8l8.4-3.6" stroke="#93c5fd" stroke-width="2"/>
                 </svg>
             </div>
             <span>Разработано командой <strong>Codelink</strong> &bull; RiskFlow Orchestrator MVP</span>

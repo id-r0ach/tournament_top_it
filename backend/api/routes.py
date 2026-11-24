@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import UUID
@@ -138,8 +138,41 @@ async def trigger_cron(
     body: Optional[DemoCronRequest] = Body(default=None),
 ):
     """Демо-кнопка: имитирует регламентный запуск от планировщика (MACHINE)."""
-    resolved_process_id = process_id or (body.process_id if body else "credit_risk")
-    resolved_target_date = target_date or (body.target_date if body else date.today())
+    p_id = process_id or (body.process_id if body else None)
+    t_date = target_date or (body.target_date if body else None)
+
+    active_pairs = set()
+    async with orchestrator._lock:
+        for r in orchestrator._mem_runs.values():
+            if r.get("status") in ("RUNNING", "QUEUED", "WAITING_TIMER"):
+                active_pairs.add((r["process_id"], r["target_date"]))
+
+    resolved_process_id = p_id
+    resolved_target_date = t_date
+    if not resolved_process_id or not resolved_target_date or (resolved_process_id, resolved_target_date) in active_pairs:
+        candidate_procs = ["credit_risk", "counterparty_risk", "integrated_risk", "etl_transactions"]
+        base_d = resolved_target_date or date.today()
+        candidate_dates = [
+            base_d,
+            date(2026, 11, 20),
+            date(2026, 11, 19),
+            base_d - timedelta(days=1),
+            base_d + timedelta(days=1),
+            date(2026, 11, 21),
+        ]
+        found = False
+        for cp in candidate_procs:
+            for cd in candidate_dates:
+                if (cp, cd) not in active_pairs:
+                    resolved_process_id = cp
+                    resolved_target_date = cd
+                    found = True
+                    break
+            if found:
+                break
+        if not found:
+            resolved_process_id = resolved_process_id or "credit_risk"
+            resolved_target_date = resolved_target_date or date.today()
 
     req = RunCreateRequest(
         process_id=resolved_process_id,
@@ -156,6 +189,27 @@ async def trigger_cron(
         logger.warning("Ошибка trigger_cron (400): %s", exc)
         raise HTTPException(status_code=400, detail=str(exc))
     return JSONResponse(content=result)
+
+
+@router.post("/demo/reset")
+async def reset_demo_history():
+    """Очищает завершённую историю (COMPLETED/FAILED/CANCELLED) и таблицу audit_logs."""
+    pool = await database.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM runs WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')")
+            await conn.execute("DELETE FROM audit_logs")
+
+    async with orchestrator._lock:
+        orchestrator._mem_runs = {
+            k: v for k, v in orchestrator._mem_runs.items()
+            if v.get("status") in ("RUNNING", "QUEUED", "WAITING_TIMER")
+        }
+
+    await orchestrator._broadcast_state_safe()
+    return JSONResponse(
+        content={"status": "RESET", "message": "История завершённых задач и журнал аудита очищены"}
+    )
 
 
 @router.post("/demo/kill-worker/{run_id}")

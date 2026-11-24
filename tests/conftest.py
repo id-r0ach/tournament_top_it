@@ -115,8 +115,10 @@ if pytest_asyncio is not None:
             await conn.execute("DELETE FROM audit_logs")
 
         routes.orchestrator._lock_ttl_sec = 25
-        routes.orchestrator._machine_timer_interval_sec = 15
+        routes.orchestrator._machine_timer_interval_sec = 1
         routes.orchestrator._heartbeat_interval_sec = 3
+        for p in routes.orchestrator._config.get("processes", {}).values():
+            p["duration_sec"] = 0.8
         CRASHED_WORKERS.clear()
         if hasattr(routes.orchestrator, "reset_memory_state"):
             routes.orchestrator.reset_memory_state()

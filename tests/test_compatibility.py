@@ -338,6 +338,23 @@ async def test_tc05_user_priority_over_machine(client: AsyncClient):
     assert d_cron["run"]["status"] == "WAITING_TIMER"
     assert "пользовательских задач" in (d_cron["run"]["blocked_reason"] or "")
 
+    # 3. Дедупликация: пользователь запрашивает ту же задачу, спящую в WAITING_TIMER
+    r_prom = await client.post(
+        "/api/runs",
+        json={
+            "process_id": "counterparty_risk",
+            "target_date": "2026-11-20",
+            "user_name": "Аналитик 2",
+            "initiator": "USER",
+        },
+    )
+    assert r_prom.status_code == 200
+    d_prom = r_prom.json()
+    assert d_prom["action"] == "ATTACHED"
+    assert d_prom["run"]["initiator"] == "USER"
+    assert d_prom["run"]["status"] == "RUNNING"
+    assert "Аналитик 2" in d_prom["run"]["subscribers"]
+
 
 @pytest.mark.asyncio
 async def test_tc06_watchdog_ttl(client: AsyncClient):

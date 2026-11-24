@@ -118,7 +118,7 @@ class SystemStateSnapshot(BaseModel):
     active_locks: List[LockInfo]
     history: List[RunInfo]
     audit_logs: List[Union[AuditLogEntry, dict[str, Any]]]
-    config: dict[str, int]
+    config: dict[str, Any]
 
 
 class ConfigUpdateRequest(BaseModel):
