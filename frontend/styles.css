@@ -416,6 +416,14 @@ body.light-theme .help-tooltip:hover {
     border-color: var(--blue);
 }
 
+input[type="date"] {
+    color-scheme: dark;
+}
+
+body.light-theme input[type="date"] {
+    color-scheme: light;
+}
+
 .process-meta {
     margin-top: 6px;
     font-size: 0.78rem;
@@ -1058,4 +1066,39 @@ body.light-theme .help-tooltip:hover {
 
 @media (max-width: 480px) {
     .kpi-strip { grid-template-columns: 1fr; }
+}
+
+/* Custom UI Tooltip Popover */
+.ui-tooltip {
+    position: fixed;
+    z-index: 9999;
+    pointer-events: none;
+    max-width: 280px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    font-size: 12.5px;
+    line-height: 1.45;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    background: #0d1e3a;
+    border: 1px solid #2b528e;
+    color: #e2edfd;
+    font-family: var(--font-sans);
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(4px);
+    transition: opacity 0.12s ease, transform 0.12s ease, visibility 0.12s;
+    word-break: break-word;
+}
+
+.ui-tooltip.visible {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0);
+}
+
+body.light-theme .ui-tooltip {
+    background: #ffffff;
+    border: 1px solid #94b2db;
+    color: #0f172a;
+    box-shadow: 0 8px 24px rgba(17, 51, 105, 0.18);
 }

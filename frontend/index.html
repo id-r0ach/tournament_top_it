@@ -31,12 +31,12 @@
         <div class="topbar-right">
             <div class="timer-setting">
                 <span class="setting-label">Таймер машины:</span>
-                <span class="help-tooltip" title="Интервал проверки регламентных задач при отсутствии активных расчётов пользователей">?</span>
+                <span class="help-tooltip" data-tooltip="Интервал проверки регламентных задач при отсутствии активных расчётов пользователей">?</span>
                 <input type="number" id="timer-interval" min="1" max="120" value="15">
-                <button id="save-interval" class="btn btn-secondary btn-sm" title="Применить интервал таймера">Ок</button>
-                <span id="timer-countdown" class="timer-countdown" title="Время до следующей проверки регламентных задач">Через -- с</span>
+                <button id="save-interval" class="btn btn-secondary btn-sm" data-tooltip="Применить интервал таймера">Ок</button>
+                <span id="timer-countdown" class="timer-countdown" data-tooltip="Время до следующей проверки регламентных задач">Через -- с</span>
             </div>
-            <button id="theme-toggle" class="btn btn-secondary btn-icon" title="Переключить тему">☀️</button>
+            <button id="theme-toggle" class="btn btn-secondary btn-icon" data-tooltip="Переключить тему">☀️</button>
             <div class="ws-pill" id="ws-pill">
                 <span class="ws-dot" id="ws-dot"></span>
                 <span id="ws-status">Подключение...</span>
@@ -51,15 +51,15 @@
             <div class="kpi-value text-green" id="kpi-running">0</div>
         </div>
         <div class="kpi-card">
-            <div class="kpi-label">В очереди <span class="help-tooltip" title="Задачи, ожидающие освобождения ресурсов или завершения конфликтующих расчётов без блокировки таблиц СУБД">?</span></div>
+            <div class="kpi-label">В очереди <span class="help-tooltip" data-tooltip="Задачи, ожидающие освобождения ресурсов или завершения конфликтующих расчётов без блокировки таблиц СУБД">?</span></div>
             <div class="kpi-value text-amber" id="kpi-queued">0</div>
         </div>
         <div class="kpi-card">
-            <div class="kpi-label">Ожидание таймера <span class="help-tooltip" title="Регламентные задачи MACHINE, ожидающие тика таймера при отсутствии активных пользовательских расчётов (приоритет USER)">?</span></div>
+            <div class="kpi-label">Ожидание таймера <span class="help-tooltip" data-tooltip="Регламентные задачи MACHINE, ожидающие тика таймера при отсутствии активных пользовательских расчётов (приоритет USER)">?</span></div>
             <div class="kpi-value text-purple" id="kpi-timer">0</div>
         </div>
         <div class="kpi-card">
-            <div class="kpi-label">Активных блокировок <span class="help-tooltip" title="Композитные ключи (ресурс + диапазон дат + режим READ/WRITE) в распределённом менеджере блокировок с автоматическим TTL">?</span></div>
+            <div class="kpi-label">Активных блокировок <span class="help-tooltip" data-tooltip="Композитные ключи (ресурс + диапазон дат + режим READ/WRITE) в распределённом менеджере блокировок с автоматическим TTL">?</span></div>
             <div class="kpi-value text-blue" id="kpi-locks">0</div>
         </div>
         <div class="kpi-card">
@@ -97,7 +97,7 @@
 
                 <div class="form-group">
                     <label for="target-date">Целевая дата расчёта</label>
-                    <input type="date" id="target-date" class="form-control" min="2026-01-01" max="2026-12-31">
+                    <input type="date" id="target-date" class="form-control" min="2025-01-01" max="2027-12-31">
                 </div>
 
                 <!-- Карточка живой предпроверки (Dry-Run FR-15) -->
@@ -219,7 +219,7 @@
                 <div class="tabs-bar">
                     <button class="tab-btn active" data-tab="tab-history">История запусков (<span id="hist-count">0</span>)</button>
                     <button class="tab-btn" data-tab="tab-audit">Журнал аудита оркестратора (<span id="audit-count">0</span>)</button>
-                    <button id="reset-history-btn" class="btn btn-secondary btn-sm" style="margin-left:auto;" title="Очистить историю завершённых задач и журнал аудита">Очистить историю</button>
+                    <button id="reset-history-btn" class="btn btn-secondary btn-sm" style="margin-left:auto;" data-tooltip="Очистить историю завершённых задач и журнал аудита">Очистить историю</button>
                 </div>
 
                 <div id="tab-history" class="tab-content active">
@@ -251,6 +251,7 @@
         </div>
     </footer>
 
+    <div id="ui-tooltip" class="ui-tooltip" role="tooltip"></div>
     <script src="/static/app.js"></script>
 </body>
 </html>

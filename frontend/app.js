@@ -33,7 +33,8 @@ window.addEventListener("load", async () => {
         document.body.classList.toggle("light-theme", isLight);
         if (themeToggleBtn) {
             themeToggleBtn.textContent = isLight ? "🌙" : "☀️";
-            themeToggleBtn.title = "Переключить тему";
+            themeToggleBtn.setAttribute("data-tooltip", "Переключить тему");
+            themeToggleBtn.removeAttribute("title");
         }
         try {
             localStorage.setItem("riskflow_theme", isLight ? "light" : "dark");
@@ -80,6 +81,101 @@ window.addEventListener("load", async () => {
             }, 350);
         }
     };
+
+    // Instant custom UI tooltip popovers for [data-tooltip]
+    const initTooltipSystem = () => {
+        const tooltipEl = document.getElementById("ui-tooltip");
+        if (!tooltipEl) return;
+
+        let activeTarget = null;
+
+        const showTooltip = (el) => {
+            const text = el.getAttribute("data-tooltip");
+            if (!text) return;
+            activeTarget = el;
+            tooltipEl.textContent = text;
+            tooltipEl.classList.add("visible");
+            positionTooltip(el);
+        };
+
+        const hideTooltip = (el) => {
+            if (activeTarget === el || !el) {
+                tooltipEl.classList.remove("visible");
+                activeTarget = null;
+            }
+        };
+
+        const positionTooltip = (el) => {
+            if (!activeTarget) return;
+            const rect = el.getBoundingClientRect();
+            const tipRect = tooltipEl.getBoundingClientRect();
+
+            const margin = 8;
+            const tipWidth = tipRect.width || 220;
+            const tipHeight = tipRect.height || 40;
+
+            // Prefer below, flip to above if not enough room
+            let top = rect.bottom + margin;
+            if (top + tipHeight > window.innerHeight - margin) {
+                if (rect.top - tipHeight - margin >= margin) {
+                    top = rect.top - tipHeight - margin;
+                } else {
+                    top = Math.max(margin, window.innerHeight - tipHeight - margin);
+                }
+            }
+
+            // Center horizontally relative to trigger element
+            let left = rect.left + rect.width / 2 - tipWidth / 2;
+            if (left < margin) {
+                left = margin;
+            } else if (left + tipWidth > window.innerWidth - margin) {
+                left = window.innerWidth - tipWidth - margin;
+            }
+
+            tooltipEl.style.top = `${Math.round(top)}px`;
+            tooltipEl.style.left = `${Math.round(left)}px`;
+        };
+
+        document.addEventListener("mouseover", (e) => {
+            const target = e.target.closest("[data-tooltip]");
+            if (target) {
+                showTooltip(target);
+            }
+        });
+
+        document.addEventListener("mouseout", (e) => {
+            const target = e.target.closest("[data-tooltip]");
+            if (target) {
+                if (e.relatedTarget && target.contains(e.relatedTarget)) {
+                    return;
+                }
+                hideTooltip(target);
+            }
+        });
+
+        document.addEventListener("focusin", (e) => {
+            const target = e.target.closest("[data-tooltip]");
+            if (target) {
+                showTooltip(target);
+            }
+        });
+
+        document.addEventListener("focusout", (e) => {
+            const target = e.target.closest("[data-tooltip]");
+            if (target) {
+                hideTooltip(target);
+            }
+        });
+
+        window.addEventListener("scroll", () => {
+            if (activeTarget) positionTooltip(activeTarget);
+        }, { passive: true });
+        window.addEventListener("resize", () => {
+            if (activeTarget) positionTooltip(activeTarget);
+        }, { passive: true });
+    };
+
+    initTooltipSystem();
 
     // Tabs switching
     document.querySelectorAll(".tab-btn").forEach((btn) => {
@@ -642,7 +738,7 @@ window.addEventListener("load", async () => {
                         </div>
                         <div class="task-footer">
                             <span class="subscribers-list">Подписчики: ${subs || run.user_name || "—"}</span>
-                            <button class="btn btn-danger" title="Chaos-тест Watchdog TTL (NFR-02): остановка heartbeat воркера для проверки автоснятия блокировок">Имитировать сбой (TTL)</button>
+                            <button class="btn btn-danger" data-tooltip="Chaos-тест Watchdog TTL (NFR-02): остановка heartbeat воркера для проверки автоснятия блокировок">Имитировать сбой (TTL)</button>
                         </div>
                     `;
                     const crashBtn = card.querySelector("button");
