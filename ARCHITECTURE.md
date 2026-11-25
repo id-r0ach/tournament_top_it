@@ -1,7 +1,5 @@
-
----
-
 # АРХИТЕКТУРНО-ТЕХНИЧЕСКИЙ ПРОЕКТ (SDD)
+
 
 ## MVP-модуль оркестрации параллельных процессов оценки рисков
 
@@ -98,6 +96,7 @@ risk-orchestrator-mvp/
 ├── docker-compose.yml               # Поднимает PostgreSQL 16 и сервис backend
 ├── Dockerfile                       # Образ Python 3.11-slim для бэкенда
 ├── requirements.txt                 # Зависимости Python
+├── pytest.ini                       # Конфигурация запуска тестов
 ├── README.md                        # Документация запуска и гайд по проверке для жюри
 ├── config/
 │   └── processes.json               # Декларативный реестр процессов, ресурсов и окон дат
@@ -121,6 +120,7 @@ risk-orchestrator-mvp/
 │   └── app.js                       # Логика клиента: REST-запросы, предпроверка, рендер по WS
 ├── desktop_app.py                   # Запуск сервера + нативного окна через pywebview
 └── tests/
+    ├── conftest.py                  # Фикстуры pytest, клиент httpx и очистка базы
     ├── test_compatibility.py        # Тесты 4 сценариев матрицы + таймер машины + TTL Watchdog
     └── test_load_50.py              # Нагрузочный тест на 50 параллельных запросов (NFR-01, NFR-03)
 
@@ -159,7 +159,7 @@ risk-orchestrator-mvp/
       "name": "Оценка кредитного риска",
       "description": "Расчёт PD/LGD по транзакциям за скользящее окно 7 дней",
       "window_days": 7,
-      "duration_sec": 8,
+      "duration_sec": 14,
       "resources": [
         { "resource_id": "src_transactions", "mode": "READ" },
         { "resource_id": "ref_clients", "mode": "READ" },
@@ -170,7 +170,7 @@ risk-orchestrator-mvp/
       "name": "Оценка риска контрагентов",
       "description": "Анализ лимитов контрагентов (совместное чтение источников с кредитным риском)",
       "window_days": 7,
-      "duration_sec": 8,
+      "duration_sec": 14,
       "resources": [
         { "resource_id": "src_transactions", "mode": "READ" },
         { "resource_id": "ref_clients", "mode": "READ" },
@@ -181,7 +181,7 @@ risk-orchestrator-mvp/
       "name": "Обновление витрины транзакций (ETL)",
       "description": "Загрузка и корректировка транзакций за дату (пишет в src_transactions)",
       "window_days": 1,
-      "duration_sec": 6,
+      "duration_sec": 12,
       "resources": [
         { "resource_id": "src_transactions", "mode": "WRITE" }
       ]
@@ -190,7 +190,7 @@ risk-orchestrator-mvp/
       "name": "Сводный риск-отчёт (Агрегатор)",
       "description": "Читает готовые витрины кредитного риска и контрагентов",
       "window_days": 7,
-      "duration_sec": 6,
+      "duration_sec": 12,
       "resources": [
         { "resource_id": "mart_credit_risk", "mode": "READ" },
         { "resource_id": "mart_counterparty_risk", "mode": "READ" },
@@ -228,6 +228,7 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_dedup ON runs(process_id, target_date) WHERE status IN ('WAITING_TIMER', 'QUEUED', 'RUNNING');
+CREATE INDEX IF NOT EXISTS idx_runs_initiator_status ON runs(initiator, status);
 
 -- 2. Таблица активных блокировок с поддержкой TTL (NFR-02)
 CREATE TABLE IF NOT EXISTS active_locks (
@@ -241,6 +242,7 @@ CREATE TABLE IF NOT EXISTS active_locks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_active_locks_resource ON active_locks(resource_id);
+CREATE INDEX IF NOT EXISTS idx_active_locks_res_exp ON active_locks(resource_id, expires_at);
 
 -- 3. Структурированный журнал событий для аудита и ИИ-анализа (NFR-06)
 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -271,8 +273,8 @@ CREATE INDEX IF NOT EXISTS idx_src_tx_date ON src_transactions(tx_date);
 CREATE TABLE IF NOT EXISTS mart_risk_results (
     process_id      VARCHAR(64) NOT NULL,
     target_date     DATE NOT NULL,
-    total_exposure  NUMERIC(16, 2) NOT NULL,
-    weighted_risk   NUMERIC(10, 4) NOT NULL,
+    total_exposure  NUMERIC(18, 2) NOT NULL,
+    weighted_risk   NUMERIC(18, 4) NOT NULL,
     rows_processed  INT NOT NULL,
     last_run_id     UUID NOT NULL,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -406,6 +408,7 @@ async def execute_risk_job(run_id: UUID):
 | `GET /api/state` | Полный снимок состояния дашборда (`FR-14`) | **Res `200`:** `{"active_runs": [...], "queue": [...], "timer_waiting": [...], "active_locks": [...], "history": [...], "audit_logs": [...], "config": {"machine_timer_interval_sec": 15}}` |
 | `PUT /api/config` | Изменение интервала таймера машины (`UR-05`, `FR-03`) | **Req:** `{"machine_timer_interval_sec": 10}`<br><br>**Res `200`:** `{"machine_timer_interval_sec": 10}` |
 | `POST /api/demo/trigger-cron` | **Демо:** запуск регламента `MACHINE` | **Req:** `{"process_id": "credit_risk", "target_date": "2026-11-20"}`<br><br>**Res `200`:** возвращает созданный `RunInfo` с `initiator="MACHINE"` |
+| `POST /api/demo/reset` | **Демо:** очистка истории и журнала аудита | Удаляет завершённые задачи (`COMPLETED`, `FAILED`, `CANCELLED`) и очищает `audit_logs`.<br><br>**Res `200`:** `{"status": "RESET", "message": "История завершённых задач и журнал аудита очищены"}` |
 | `POST /api/demo/kill-worker/{run_id}` | **Демо:** эмуляция аварийного падения воркера (`NFR-02`) | Останавливает heartbeat воркера, чтобы Watchdog снял блокировку по TTL.<br><br>**Res `200`:** `{"status": "HEARTBEAT_STOPPED", "ttl_remaining_sec": 25}` |
 
 ### 6.2. WebSocket протокол (`/ws/events`)
